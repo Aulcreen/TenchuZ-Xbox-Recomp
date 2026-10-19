@@ -19,6 +19,9 @@ class Runtime;
 
 namespace tenchuz::native {
 
+// Before the D3D12 device exists: DRED for GPU hang reports (--tenchuz_dred).
+void EnableDeviceDiagnostics();
+
 void Initialize(rex::Runtime* runtime);
 
 bool PresentNative();

@@ -20,10 +20,11 @@ parser.add_argument("--end", default="0x82450000")
 # 0x8241BF50: D3D Swap, hooked in frame_stats.cpp. 0x82425790: GPU-wait spin loop
 # (~500k calls per frame, would flood the capture buffer). 0x8241B308 Clear and
 # 0x8241D770 Resolve, 0x8241A780 SetRenderTarget, 0x8241C790 BeginTiling: hooked in
-# renderer/native_renderer.cpp (HookScope keeps them traced).
+# renderer/native_renderer.cpp (HookScope keeps them traced), as is 0x8242A4F8 (gamma
+# ramp to the display LUT).
 parser.add_argument("--exclude", nargs="*",
                     default=["0x8241BF50", "0x82425790", "0x8241B308", "0x8241D770", "0x8241A780",
-                             "0x8241C790"])
+                             "0x8241C790", "0x8242A4F8"])
 parser.add_argument("--init", default="generated/default/tenchuz_init.cpp")
 parser.add_argument("--out", default="src/renderer/d3d_trace_hooks.gen.cpp")
 args = parser.parse_args()

@@ -32,6 +32,7 @@ class TenchuzApp : public rex::ReXApp {
     if (config.gpu_plugin.empty()) {
       config.gpu_plugin = "xenos";
     }
+    tenchuz::native::EnableDeviceDiagnostics();
   }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {

@@ -40,6 +40,11 @@ using LiveDrawCallback = void (*)(const pm4::DrawInfo& draw, const pm4::Decoder&
                                   uint8_t* base, uint32_t api_function);
 void SetLiveDecoding(bool enable, LiveDrawCallback callback);
 
+// Called at the start of every hooked D3D call on the render thread while
+// decoding (nested ones too), before the call runs.
+using CallCallback = void (*)(uint32_t function, uint8_t* base);
+void SetCallCallback(CallCallback callback);
+
 // Times decoding jumped ahead (skipping any packets in between) since the last
 // call, by reason, and the bytes skipped by gap jumps.
 struct ResyncStats {

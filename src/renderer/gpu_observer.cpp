@@ -77,6 +77,7 @@ std::atomic<bool> g_active{false};  // decoding (for an observation and/or live 
 std::atomic<bool> g_requested{false};
 std::atomic<bool> g_live_requested{false};
 LiveDrawCallback g_live_callback = nullptr;
+CallCallback g_call_callback = nullptr;
 bool g_decoding = false;
 State g_state = State::kOff;
 uint32_t g_device = 0;
@@ -406,6 +407,9 @@ void Enter(uint32_t function, uint8_t* base) {
   if (!OnRenderThread()) {
     return;
   }
+  if (g_call_callback) {
+    g_call_callback(function, base);
+  }
   if (g_depth++ == 0) {
     g_top_function = function;
   }
@@ -523,6 +527,10 @@ void OnSwap(uint32_t device, uint8_t* base) {
   g_debug_lines = 0;
   g_state = State::kWarmup;
   REXLOG_INFO("tenchuz: GPU observe armed at frame {} (device {:08X})", g_frame, device);
+}
+
+void SetCallCallback(CallCallback callback) {
+  g_call_callback = callback;
 }
 
 void SetLiveDecoding(bool enable, LiveDrawCallback callback) {

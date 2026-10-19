@@ -12,16 +12,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
 
+#include <fmt/format.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/cvar.h>
+#include <rex/system/xmemory.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(tenchuz_native_texture_watch, true, "tenchuz",
+                    "Native textures reload when the guest writes to their memory (false: compare hashes every frame)");
 
 namespace tenchuz::native {
 
@@ -68,6 +75,8 @@ constexpr uint64_t kEvictAfterFrames = 600;  // textures unused this long are re
 constexpr uint32_t kFullHashMax = 64u << 10;    // larger textures are change-checked by sampling
 constexpr uint32_t kHashStride = 2048;
 constexpr uint32_t kHashSample = 64;
+constexpr uint32_t kGuestPhysicalSize = 512u << 20;
+constexpr uint32_t kWatchPageShift = 12;
 
 enum LoadShaderIndex {
   kLoadShaderIndex8bpb,
@@ -580,6 +589,56 @@ struct TextureLoader::Impl {
   Stats stats;
   uint32_t logged_unsupported = 0;
 
+  // Write watching. A guest write to a watched page (the SDK protects it, and
+  // the first write triggers the invalidation callbacks once, from its access
+  // violation handler) stamps the page with a new sequence number; a texture
+  // reloads when a page it covers is newer than its last load. Per-page
+  // sequences rather than dirty bits, as textures can share pages.
+  rex::memory::Memory* memory = nullptr;
+  void* watch_handle = nullptr;
+  std::atomic<uint32_t> write_sequence{0};
+  std::vector<std::atomic<uint32_t>> page_written =
+      std::vector<std::atomic<uint32_t>>(kGuestPhysicalSize >> kWatchPageShift);
+  std::atomic<uint32_t> written_pages{0};
+
+  // Invalidation callback: runs with the SDK's global lock held, on whatever
+  // thread wrote, so it only touches atomics. Returning the exact range keeps
+  // other subscribers' wider ranges from unprotecting pages still watched here.
+  static std::pair<uint32_t, uint32_t> OnWritten(void* context, uint32_t start, uint32_t length, bool) {
+    auto* self = static_cast<Impl*>(context);
+    start &= kGuestPhysicalSize - 1;
+    const uint64_t end = std::min<uint64_t>(uint64_t(start) + length, kGuestPhysicalSize);
+    const uint32_t sequence = self->write_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    for (uint64_t page = start >> kWatchPageShift; page < (end + (1u << kWatchPageShift) - 1) >> kWatchPageShift;
+         ++page) {
+      self->page_written[page].store(sequence, std::memory_order_relaxed);
+      self->written_pages.fetch_add(1, std::memory_order_relaxed);
+    }
+    return {start, length};
+  }
+
+  // Whether a page in [start, start + size) was written after `sequence`.
+  bool WrittenSince(uint32_t start, uint32_t size, uint32_t sequence) const {
+    if (!size) {
+      return false;
+    }
+    start &= kGuestPhysicalSize - 1;
+    const uint64_t end = std::min<uint64_t>(uint64_t(start) + size, kGuestPhysicalSize);
+    for (uint64_t page = start >> kWatchPageShift; page < (end + (1u << kWatchPageShift) - 1) >> kWatchPageShift;
+         ++page) {
+      if (page_written[page].load(std::memory_order_relaxed) > sequence) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void Watch(uint32_t start, uint32_t size) {
+    if (size) {
+      memory->EnablePhysicalMemoryAccessCallbacks(start & (kGuestPhysicalSize - 1), size, true, false);
+    }
+  }
+
   struct Entry {
     Key key;
     ComPtr<ID3D12Resource> resource;
@@ -588,6 +647,7 @@ struct TextureLoader::Impl {
     LoadShaderIndex load_shader = kLoadShaderIndexUnknown;
     bool decompress = false;
     uint64_t base_hash = 0, mips_hash = 0;
+    uint32_t loaded_sequence = 0;  // write sequence when last loaded (watching)
     uint64_t checked_frame = 0;  // also the last frame it was used
     bool loaded = false;
   };
@@ -604,9 +664,13 @@ struct TextureLoader::Impl {
     return h;
   }
 
-  bool Initialize(ID3D12Device* d, ID3D12Resource* shared, uint64_t shared_size) {
+  bool Initialize(ID3D12Device* d, ID3D12Resource* shared, uint64_t shared_size, rex::memory::Memory* mem) {
     device = d;
     shared_memory = shared;
+    if (mem && REXCVAR_GET(tenchuz_native_texture_watch)) {
+      memory = mem;
+      watch_handle = memory->RegisterPhysicalMemoryInvalidationCallback(&Impl::OnWritten, this);
+    }
     auto serialize = reinterpret_cast<HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*,
                                                        D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**)>(
         GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12SerializeRootSignature"));
@@ -883,6 +947,7 @@ struct TextureLoader::Impl {
                                                IID_PPV_ARGS(&copy_buffer)))) {
       return false;
     }
+    SetDebugName(copy_buffer.Get(), "tenchuz texture load scratch");
     scratch[slot].push_back(copy_buffer);
     const uint32_t uav_index = 3 + slot * kUavRingSize + uavs_used[slot]++;
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
@@ -993,11 +1058,11 @@ struct TextureLoader::Impl {
     return true;
   }
 
-  bool Get(ID3D12GraphicsCommandList* list, const xenos::xe_gpu_texture_fetch_t& fetch, uint8_t* base,
-           const Upload& upload, Texture& out) {
+  Result Get(ID3D12GraphicsCommandList* list, const xenos::xe_gpu_texture_fetch_t& fetch, uint8_t* base,
+             const Upload& upload, Texture& out) {
     Key key;
     if (!KeyFromFetch(fetch, key)) {
-      return false;
+      return Result::kNoAddress;
     }
     const uint64_t hash = key.Hash();
     auto it = entries.find(hash);
@@ -1017,15 +1082,17 @@ struct TextureLoader::Impl {
           REXLOG_WARN("tenchuz: N4 texture format {} ({}x{}) not supported natively", uint32_t(key.format),
                       key.width, key.height);
         }
-        return false;
+        return Result::kUnsupported;
       }
       e.layout = texture_util::GetGuestTextureLayout(key.dimension, key.pitch, key.width, key.height,
                                                      key.depth_or_array_size, key.tiled, key.format,
                                                      key.packed_mips, key.base_page != 0, key.mip_max_level);
       e.resource.Attach(CreateResource(e, format));
       if (!e.resource) {
-        return false;
+        return Result::kFailed;
       }
+      SetDebugName(e.resource.Get(), fmt::format("tenchuz texture {:08X} {}x{} format {}", key.base_page << 12,
+                                                 key.width, key.height, uint32_t(key.format)));
       it = entries.emplace(hash, std::move(e)).first;
     }
     Entry& e = it->second;
@@ -1033,24 +1100,46 @@ struct TextureLoader::Impl {
     // Reload when the guest data changed (checked once per frame).
     if (e.checked_frame != frame) {
       e.checked_frame = frame;
-      const uint64_t base_hash = HashRange(base, key.base_page, e.layout.base.level_data_extent_bytes);
-      const uint64_t mips_hash = HashRange(base, key.mip_page, e.layout.mips_total_extent_bytes);
-      if (!e.loaded || base_hash != e.base_hash || mips_hash != e.mips_hash) {
+      const uint32_t base_address = key.base_page << 12, base_size = e.layout.base.level_data_extent_bytes;
+      const uint32_t mips_address = key.mip_page << 12, mips_size = e.layout.mips_total_extent_bytes;
+      uint64_t base_hash = 0, mips_hash = 0;
+      uint32_t sequence = 0;
+      bool reload;
+      if (memory) {
+        reload = !e.loaded || (key.base_page && WrittenSince(base_address, base_size, e.loaded_sequence)) ||
+                 (key.mip_page && WrittenSince(mips_address, mips_size, e.loaded_sequence));
+        if (reload) {
+          // Watch before copying: a write from here on stamps a newer sequence.
+          sequence = write_sequence.load(std::memory_order_relaxed);
+          if (key.base_page) {
+            Watch(base_address, base_size);
+          }
+          if (key.mip_page) {
+            Watch(mips_address, mips_size);
+          }
+        }
+      } else {
+        base_hash = HashRange(base, key.base_page, base_size);
+        mips_hash = HashRange(base, key.mip_page, mips_size);
+        reload = !e.loaded || base_hash != e.base_hash || mips_hash != e.mips_hash;
+      }
+      if (reload) {
         if (key.base_page) {
-          upload(key.base_page << 12, e.layout.base.level_data_extent_bytes);
+          upload(base_address, base_size);
         }
         if (key.mip_page) {
-          upload(key.mip_page << 12, e.layout.mips_total_extent_bytes);
+          upload(mips_address, mips_size);
         }
         if (Load(list, e)) {
           e.loaded = true;
           e.base_hash = base_hash;
           e.mips_hash = mips_hash;
+          e.loaded_sequence = sequence;
         }
       }
     }
     if (!e.loaded) {
-      return false;
+      return Result::kFailed;
     }
     const D3D12_RESOURCE_STATES srv_state =
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -1067,15 +1156,16 @@ struct TextureLoader::Impl {
     out.dimension = key.dimension;
     out.mip_levels = key.mip_max_level + 1;
     out.array_size = key.dimension == xenos::DataDimension::k3D ? 1 : key.depth_or_array_size;
-    return true;
+    return Result::kLoaded;
   }
 };
 
 TextureLoader::TextureLoader() : impl_(std::make_unique<Impl>()) {}
 TextureLoader::~TextureLoader() = default;
 
-bool TextureLoader::Initialize(ID3D12Device* device, ID3D12Resource* shared_memory, uint64_t shared_memory_size) {
-  return impl_->Initialize(device, shared_memory, shared_memory_size);
+bool TextureLoader::Initialize(ID3D12Device* device, ID3D12Resource* shared_memory, uint64_t shared_memory_size,
+                               rex::memory::Memory* memory) {
+  return impl_->Initialize(device, shared_memory, shared_memory_size, memory);
 }
 
 void TextureLoader::BeginFrame(uint32_t slot) {
@@ -1096,14 +1186,15 @@ void TextureLoader::BeginFrame(uint32_t slot) {
   }
 }
 
-bool TextureLoader::Get(ID3D12GraphicsCommandList* list, const xenos::xe_gpu_texture_fetch_t& fetch, uint8_t* base,
-                        const Upload& upload, Texture& out) {
+TextureLoader::Result TextureLoader::Get(ID3D12GraphicsCommandList* list, const xenos::xe_gpu_texture_fetch_t& fetch,
+                                         uint8_t* base, const Upload& upload, Texture& out) {
   return impl_->Get(list, fetch, base, upload, out);
 }
 
 TextureLoader::Stats TextureLoader::TakeFrameStats() {
   Stats s = impl_->stats;
   s.textures = uint32_t(impl_->entries.size());
+  s.written_pages = impl_->written_pages.exchange(0, std::memory_order_relaxed);
   impl_->stats = {};
   return s;
 }

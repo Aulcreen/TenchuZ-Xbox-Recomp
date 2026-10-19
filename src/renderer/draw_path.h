@@ -19,14 +19,23 @@
 #include "pm4_decoder.h"
 #include "shader_cache.h"
 
+namespace rex::memory {
+class Memory;
+}
+
 namespace tenchuz::native {
 
 struct DrawTarget {
-  DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+  // Colour targets by guest index (RT0-3). UNKNOWN = not bound; its RTV is
+  // then a null descriptor (gaps before the last bound target need one).
+  DXGI_FORMAT color_formats[4] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                  DXGI_FORMAT_UNKNOWN};
+  D3D12_CPU_DESCRIPTOR_HANDLE rtvs[4] = {};
+  uint32_t color_mask = 0;  // DrawPath::WrittenColorMask, 4 bits per target
   DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;  // UNKNOWN = no depth buffer
   D3D12_CPU_DESCRIPTOR_HANDLE dsv = {};
   uint32_t width = 0, height = 0;
+  uint32_t samples = 1;  // MSAA sample count of every bound target
 };
 
 // What the draw path needs from the renderer that owns the frame.
@@ -56,22 +65,45 @@ class DrawHost {
   ~DrawHost() = default;
 };
 
+// Why a texture binding got a placeholder (DrawStats::placeholders).
+enum PlaceholderReason : uint32_t {
+  kPlaceholderNotTexture,   // the fetch constant isn't a texture
+  kPlaceholderNoAddress,    // no base or mip address, or a 1D texture too wide
+  kPlaceholderUnsupported,  // guest format not supported natively
+  kPlaceholderLoadFailed,   // texture creation or load failed
+  kPlaceholderSignedView,   // signed fetch of a format with no signed view
+  kPlaceholderStacked3D,    // stacked 2D texture sampled as 3D (SDK wrapper not ported)
+  kPlaceholderDimension,    // other dimension mismatch (2D vs 3D, cube)
+  kPlaceholderReasonCount,
+};
+
 struct DrawStats {
   uint32_t issued = 0;
   uint32_t skipped_primitive = 0;  // primitive types not handled yet (fans, rect lists, quads)
   uint32_t skipped_primitive_types = 0;  // bit per xenos::PrimitiveType skipped
   uint32_t skipped_pipeline = 0;   // pipeline creation failed
+  uint32_t skipped_culled = 0;     // both faces culled
+  uint32_t mrt_draws = 0;          // draws writing more than one colour target
+  uint32_t stencil_draws = 0;      // draws with the stencil test on
   uint32_t skipped_other = 0;
   uint32_t uploaded_kb = 0;
   uint32_t arena_kb = 0;          // dynamic vertices and indices copied per draw
   uint32_t dynamic_rewrites = 0;  // command-ring pages rewritten after this frame copied them
   uint32_t flushes = 0;           // mid-frame submits for those rewrites
+  uint32_t reset_converted = 0;   // index buffers copied to map the guest reset index to all-ones
+  uint32_t stale_pages = 0;       // static pages rewritten after this frame uploaded them (recheck mode)
   uint32_t textures_resolved = 0;  // fetches given a resolved render target
   uint32_t textures_guest = 0;     // fetches given a loaded guest texture
   uint32_t textures_missing = 0;   // fetches given a placeholder
+  uint32_t placeholders[kPlaceholderReasonCount] = {};  // textures_missing by reason
+  // Signed bindings of fetches with no signed component: the translator
+  // declares a signed and an unsigned binding per fetch, and only samples the
+  // signed one for signed components. Given a placeholder, never sampled.
+  uint32_t signed_unused = 0;
   // Guest texture loading (texture_loader.h).
   uint32_t texture_loads = 0, texture_loaded_kb = 0, texture_hashed_kb = 0;
   uint32_t texture_unsupported = 0, textures_cached = 0;
+  uint32_t texture_written_pages = 0;  // watched texture pages the guest wrote to
 };
 
 class DrawPath {
@@ -79,7 +111,14 @@ class DrawPath {
   DrawPath();
   ~DrawPath();
 
-  bool Initialize(ID3D12Device* device);
+  // `memory`: guest memory, for texture write watching (null: hash instead).
+  bool Initialize(ID3D12Device* device, rex::memory::Memory* memory);
+
+  // The colour components a draw writes, 4 bits per render target (SDK
+  // draw_util::GetNormalizedColorMask): targets the pixel shader writes, with
+  // RB_COLOR_MASK, in kColorDepth mode only. RB_COLOR*_INFO from the device.
+  static uint32_t WrittenColorMask(const pm4::Decoder& state, uint8_t* base, uint32_t device_address,
+                                   const DrawShaders& shaders);
 
   // Start of a frame slot (after its fence has been waited on).
   void BeginFrame(uint32_t slot);
@@ -97,6 +136,13 @@ class DrawPath {
   // resolve copies), so hang reports can name it. `what` must be a literal.
   uint32_t BeginOp(ID3D12GraphicsCommandList* list, const char* what, uint32_t a, uint32_t b);
   void EndOp(uint32_t op);
+
+  // Lists every draw and operation recorded this frame (frame logging), once
+  // the GPU has finished it, with per-draw samples if queries are on.
+  void LogFrameDraws(uint64_t frame);
+
+  // Before the frame's command list is closed: resolves its draw queries.
+  void EndFrame(ID3D12GraphicsCommandList* list, uint64_t frame);
 
   // Logs the draws the GPU had started but not finished (breadcrumbs written
   // around every draw), after the device was removed for a hang. Runs once.

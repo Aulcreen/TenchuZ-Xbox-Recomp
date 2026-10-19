@@ -172,13 +172,114 @@ with a few fixed-step candidates to test at 60 fps.
     1,745 guest textures, 1,279 placeholders, 0 unsupported formats. The intro movie plays
     natively (6 guest textures a frame, 30 fps). In A/B captures native output looks darker
     than the emulator's; that's not explained yet.
-- **N4.4 Remaining pipeline state.** *Next.* Culling (draws use `CullMode NONE`), multiple render
-  targets (only RT0 is bound), stencil, MSAA, and the darker output (the native present has no
-  gamma-ramp step; check that first). The 1,279 placeholder fetches per gameplay frame need a
-  count by reason: non-texture fetch constants, stacked 2D sampled as 3D, signed resolved
-  targets. Texture invalidation should move from hashing (about 33 MB per gameplay frame) to
-  write watching. A same-frame A/B dump in shadow mode (emulator front buffer next to the native
-  one) would make parity measurable.
+- **N4.4 Remaining pipeline state.** ✅ *Done (2026-10-19)*. In A/B screenshots of character
+  creation, the Ninja Village and Mission 1, native output matches the emulator: mean colour
+  within 2/255, and sharpness within 3% (mean edge strength). Every draw is issued (570 of 570 in
+  the mission), with 0 real placeholder textures and no texture hashing.
+  - Comparing: start in emulator output, take its screenshot, then F10 to native (the reverse
+    order is invalid, see the last item). A same-frame comparison through guest memory isn't
+    possible: the emulator keeps its resolves in its own GPU memory.
+  - Route into Mission 1 (Path of the Ninja), after the Ninja Village route (~64 s):
+    1. Hold W 2.5 s to reach "Accept mission", then press A six times (accept, go on mission,
+       mission select, details, yes, depart), 2.6 s apart.
+    2. About 11 s later, Start skips the intro text.
+    3. About 11 s after that, A then Start: the game ends up paused, and Start resumes.
+  - Done (2026-10-19): **colour parity.** In A/B screenshots (emulator, then F10 to native), the
+    mean colour matches within 2/255 in character creation and the Ninja Village. Before, the 3D
+    scene was red/blue swapped and the image darker. Two causes:
+    - **Resolves ignored `RB_COPY_DEST_INFO`.** The value read was always 0. Resolve keeps the
+      register in the device (`+0x29A4`) only while it runs and writes 0 there before returning.
+      In tiled passes, its packets go to per-tile blocks the observer can't decode yet. It is now
+      read from the device at the D3D calls Resolve makes, through a new observer callback. The
+      game's colour resolves are `01000302`: red/blue swap, k_8_8_8_8, 8-in-32. The swap, the
+      destination format and the exponent bias now apply.
+    - **No display gamma ramp.** `sub_8242A4F8` (called by `sub_8241BC70`) writes a D3DGAMMARAMP
+      to the 256-entry LUT. It is hooked, and the present blit applies the table like the SDK's
+      `apply_gamma_table`. The game's ramp lifts black to 44/1023 and brightens shadows. The
+      game sets it at startup, before native decoding starts. The 10-bit PWL ramp
+      (`sub_8242A5D8`, for 2_10_10_10 front buffers) isn't handled, and Tenchu doesn't use it.
+  - Done: **rasterizer state**, following the SDK pipeline cache's RTV path:
+    - cull mode and front face from `PA_SU_SC_MODE_CNTL`, with draws culling both faces dropped;
+    - wireframe for line and point polygon modes;
+    - depth bias from the polygon offset of the face that isn't culled (integer units for our
+      D32_FLOAT depth match unorm24's only for z in [0.5, 1));
+    - depth clip from `PA_CL_CLIP_CNTL`.
+  - Done: **EDRAM mode**, like the SDK's `IssueDraw`. Draws in copy mode (resolves) aren't
+    drawn, and only `kColorDepth` runs the pixel shader (`kDepthOnly` writes depth alone).
+  - Done: **multiple render targets and stencil**, following the SDK's RTV path. A draw binds
+    each of RT0-3 that both the pixel shader writes and `RB_COLOR_MASK` enables (the SDK's
+    normalized colour mask). Unbound targets before the last bound one get a null RTV.
+    - Each target has its own blend, write mask, exponent bias and gamma conversion.
+    - Depth and stencil come from the SDK's normalized `RB_DEPTHCONTROL`: front and back ops,
+      masks and reference from `RB_STENCILREFMASK`, and `_BF` when only back faces are drawn.
+    - A Resolve's depth clear keeps the stencil value (`RB_DEPTH_CLEAR` bits 0-7).
+    - Draws with no colour target, i.e. depth-only passes, are no longer dropped: 14 per Ninja
+      Village frame, now 325 of 325 issued.
+    - Character creation and the Ninja Village use neither MRT nor stencil (the frame log now
+      counts both), so those paths aren't exercised there yet. The A/B colour match is
+      unchanged.
+  - Done: **placeholder texture fetches, by reason.** Each logged frame now has a "NATIVE
+    placeholders" line (not a texture, no address, unsupported format, load failed, no signed
+    view, stacked 2D as 3D, other dimension). In the Ninja Village, every placeholder was the
+    signed binding of a fetch with no signed component. The translator declares a signed and an
+    unsigned binding per fetch and samples the signed one only for signed components.
+    - Those bindings now get the placeholder without a texture lookup or load, as the SDK only
+      loads signed views when needed. They're counted apart as "unused signed bindings".
+    - Village frame: 0 real placeholders. 215 bindings had been loading textures from stale
+      guest memory at resolve addresses (26 bogus cached textures), and texture hashing dropped
+      from 14.4 to 13.4 MB per frame. The image is identical.
+    - Mission 1: 1,731 unused signed bindings per frame and 0 real placeholders, so the earlier
+      1,279 "placeholders" per gameplay frame were these bindings.
+  - Done: **MSAA**, like the SDK's RTV path, with D3D12's own 2x/4x sample positions. Render
+    targets and depth buffers take the sample count from `RB_SURFACE_INFO`, when the host supports
+    it for every target format (`--tenchuz_native_msaa=false` turns MSAA off).
+    - Resolves from multisampled targets run in a compute pass. Colour averages or picks samples
+      per `RB_COPY_CONTROL.copy_sample_select`, captured during Resolve like `RB_COPY_DEST_INFO`
+      (the game averages both samples: `k01`). Depth takes one sample.
+    - The system constants gain alpha to coverage and the sample count.
+    - The game's 3D passes are 2x MSAA, and their edges now match the emulator's anti-aliasing.
+  - Done: **the half-pixel offset.** With Direct3D 9 pixel centres (`PA_SU_VTX_CNTL.pix_center`),
+    the viewport offset gains half a pixel, like the SDK's `GetHostViewportInfo`.
+    - Without it, the game's full-screen passes sampled exact texels where it means to sample
+      between them, so native output was sharper than the emulator's.
+    - Character creation, mean edge strength: emulator 5.98; native 9.4-10.0 before, 5.97 after.
+      Mission 1: 2.04 against 1.99.
+  - Done: **texture write watching** (`--tenchuz_native_texture_watch`, on by default; false
+    compares hashes as before). The texture loader registers an SDK physical-memory invalidation
+    callback.
+    - A guest write to a watched page stamps it with a sequence number. A texture reloads only if
+      one of its pages is newer than its last load, and re-watches its pages before copying them.
+    - The callback returns the exact page range, so other subscribers (the emulator) can't
+      unprotect pages it still watches.
+    - Mission 1: texture hashing went from 32.6 MB per frame to 0, with no reloads after the
+      first load and an identical image. The intro movie (textures rewritten every frame)
+      reloads its 3 textures each frame and plays.
+    - The frame log's "written pages" counts every page the SDK reported written, including
+      pages only the emulator watches.
+  - Found: **the emulator's state degrades while native output is on.** The swap packet is turned
+    into NOPs, so the SDK's `IssueSwap` never runs. That function is the only place its frame
+    closes. Per-frame state isn't reset, for example `vertex_buffers_in_sync_`. Its upload pools
+    are never reclaimed: non-local GPU and private memory grow about 3.6 MB/s. After a native
+    stretch, F10 back to the emulator shows stale geometry (title-menu leftovers in character
+    creation). For A/B, take the emulator shot first. Fixing this needs an SDK change, or N5.
+  - Fixed (2026-10-19): the native flicker. In the Ninja Village, a few frames out of every 16
+    turned blue and blurred. The village water is one 32-bit triangle strip (9,417 indices) that
+    restarts its rows with index 0xFFFF; Xenos takes the restart value from
+    `VGT_MULTI_PRIM_IB_RESET_INDX`, but D3D12 only cuts strips at all-ones. Each restart became
+    a real vertex far past the vertex data, and as the waves moved, the triangles to it covered
+    the screen up to 47 times. Strip draws with any other restart value now get a copy of their
+    indices with that value rewritten to all-ones, like the SDK's primitive processor. Village
+    bursts: 11 glitched frames in 140 before, 0 after (the emulator: 0).
+  - Diagnostics added on the way (all off by default): `--tenchuz_native_log_draws` (every draw
+    and operation of a logged frame, in order), `--tenchuz_native_draw_queries` (per-draw
+    occlusion query; samples in the draw list) with `--tenchuz_native_log_coverage=N` (every
+    frame, the draws that passed more than N samples), `--tenchuz_native_trace_vs=<hash>` (every
+    constant, vertex and index range of one shader's draws), `--tenchuz_native_check_late_writes`
+    (guest data changed after we copied it), `--tenchuz_native_recheck_pages` (static pages
+    rewritten within a frame), and `--tenchuz_native_dump_frames=N` (F11 and
+    `--tenchuz_native_dump_at_frame` dump and log N consecutive frames). Scripted input needs
+    `--mnk_mode=true`. For GPU device removals, `--tenchuz_dred=true` adds DRED's unfinished
+    command lists and page-fault allocations to the removal report.
 - **N4 Draws.** Shaders (SDK translator → DXBC/DXIL, cached by microcode hash), vertex/index
   buffers (byte-swapped), textures (untile + upload, cached), samplers, blend, depth, and cull.
   Exit: menus and the dojo match the Xenos path.

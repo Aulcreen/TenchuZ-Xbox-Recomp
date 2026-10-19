@@ -123,8 +123,17 @@ bool ShaderCache::Prepare(const pm4::DrawInfo& draw, const pm4::Decoder& state, 
   const auto& regs = *reinterpret_cast<const gfx::RegisterFile*>(state.regs);
   out = {};
 
+  // Like the SDK's IssueDraw: a draw in EDRAM copy mode is a resolve, and only
+  // kColorDepth runs the pixel shader (kDepthOnly writes depth alone).
+  const auto edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode == xenos::EdramMode::kCopy) {
+    ++stats_.copy_mode_draws;
+    return false;
+  }
   gfx::Shader* vs = impl_->GetShader(xenos::ShaderType::kVertex, state.vertex_shader, base, stats_);
-  gfx::Shader* ps = impl_->GetShader(xenos::ShaderType::kPixel, state.pixel_shader, base, stats_);
+  gfx::Shader* ps = edram_mode == xenos::EdramMode::kColorDepth
+                        ? impl_->GetShader(xenos::ShaderType::kPixel, state.pixel_shader, base, stats_)
+                        : nullptr;
   if (!vs || !vs->is_ucode_analyzed()) {
     return false;
   }

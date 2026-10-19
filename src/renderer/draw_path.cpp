@@ -26,6 +26,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/cvar.h>
@@ -34,6 +35,17 @@
 
 REXCVAR_DEFINE_BOOL(tenchuz_native_ring_flush, false, "tenchuz",
                     "Native draws: flush mid-frame when command-ring vertex pages are rewritten");
+REXCVAR_DEFINE_INT32(tenchuz_native_recheck_pages, 0, "tenchuz",
+                     "Native draws: 1 = count static vertex/index pages whose guest memory changed after "
+                     "this frame uploaded them, 2 = also upload them again");
+REXCVAR_DEFINE_BOOL(tenchuz_native_check_late_writes, false, "tenchuz",
+                    "Native draws: at frame end, log guest vertex/index data that changed after it was copied");
+REXCVAR_DEFINE_STRING(tenchuz_native_trace_vs, "", "tenchuz",
+                      "Native draws: log the constants, vertex and index ranges of draws with this VS hash (hex)");
+REXCVAR_DEFINE_INT32(tenchuz_native_log_coverage, 0, "tenchuz",
+                     "With draw queries: every frame, list the draws that passed more than N samples");
+REXCVAR_DEFINE_BOOL(tenchuz_native_draw_queries, false, "tenchuz",
+                    "Native draws: occlusion query per draw, listed with tenchuz_native_log_draws");
 REXCVAR_DEFINE_BOOL(tenchuz_native_debug_textures, false, "tenchuz",
                     "Native draws sample a UV-gradient checker instead of white (geometry check)");
 
@@ -58,6 +70,7 @@ constexpr uint32_t kViewRingSize = 16384;             // shader-visible descript
 constexpr uint32_t kSamplerTableSize = 16;    // default linear/wrap table at the heap start
 constexpr uint32_t kSamplerHeapSize = 2048;   // shader-visible sampler heap maximum
 constexpr uint32_t kDevColorInfo = 0x2804;    // RB_COLOR_INFO in the device shadow
+constexpr uint32_t kDevColor1Info = 0x280C;   // RB_COLOR1_INFO (RT2, RT3 at +4, +8)
 constexpr uint32_t kPageShift = 12;
 constexpr uint32_t kPageSize = 1u << kPageShift;
 constexpr uint32_t kCbAlign = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
@@ -208,6 +221,96 @@ D3D12_BLEND_OP BlendOp(uint32_t op) {
   }
 }
 
+// Rasterizer state, as the SDK's pipeline cache derives it for its RTV path
+// (PipelineCache::GetCurrentStateDescription, draw_util::
+// GetPreferredFacePolygonOffset): D3D12 has one fill mode and depth bias for
+// both faces, so those of the face that isn't culled are used. Draws with both
+// faces culled are dropped before this.
+struct RasterState {
+  D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE;
+  bool front_counter_clockwise = false;
+  bool wireframe = false;
+  bool depth_clip = true;
+  int32_t depth_bias = 0;
+  float slope_scaled_depth_bias = 0.0f;
+};
+
+RasterState GetRasterState(const gfx::RegisterFile& regs, bool polygonal) {
+  RasterState r;
+  const auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  float scale = 0.0f, offset = 0.0f;
+  if (polygonal) {
+    r.front_counter_clockwise = mode.face == 0;
+    r.cull = mode.cull_front ? D3D12_CULL_MODE_FRONT : (mode.cull_back ? D3D12_CULL_MODE_BACK : D3D12_CULL_MODE_NONE);
+    // No point fill mode in D3D12: points are drawn as wireframe too.
+    r.wireframe = mode.poly_mode == xenos::PolygonModeEnable::kDualMode &&
+                  ((!mode.cull_front && mode.polymode_front_ptype != xenos::PolygonType::kTriangles) ||
+                   (!mode.cull_back && mode.polymode_back_ptype != xenos::PolygonType::kTriangles));
+    if (mode.poly_offset_front_enable && !mode.cull_front) {
+      scale = regs.Get<float>(gfx::XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
+      offset = regs.Get<float>(gfx::XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+    }
+    if (mode.poly_offset_back_enable && !mode.cull_back && !scale && !offset) {
+      scale = regs.Get<float>(gfx::XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE);
+      offset = regs.Get<float>(gfx::XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET);
+    }
+  } else if (mode.poly_offset_para_enable) {
+    scale = regs.Get<float>(gfx::XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
+    offset = regs.Get<float>(gfx::XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
+  }
+  // Integer bias in the guest depth format's units. Our depth buffers are
+  // D32_FLOAT, where a unit is 2^(exponent of the primitive's max z - 23):
+  // the same as unorm24's for z in [0.5, 1), smaller nearer the camera.
+  r.depth_bias = gfx::draw_util::GetD3D10IntegerPolygonOffset(regs.Get<reg::RB_DEPTH_INFO>().depth_format, offset);
+  r.slope_scaled_depth_bias = scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+  r.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+  return r;
+}
+
+// RB_COLOR_INFO of render target `index` from the device: the decoded value
+// is stale in tiled passes.
+reg::RB_COLOR_INFO DeviceColorInfo(uint8_t* base, uint32_t device_address, uint32_t index) {
+  reg::RB_COLOR_INFO info;
+  info.value = REX_LOAD_U32(device_address + (index ? kDevColor1Info + 4 * (index - 1) : kDevColorInfo));
+  return info;
+}
+
+constexpr gfx::Register kBlendControl[4] = {gfx::XE_GPU_REG_RB_BLENDCONTROL0, gfx::XE_GPU_REG_RB_BLENDCONTROL1,
+                                            gfx::XE_GPU_REG_RB_BLENDCONTROL2, gfx::XE_GPU_REG_RB_BLENDCONTROL3};
+
+// SDK draw_util::GetNormalizedDepthControl: depth and stencil only in
+// kColorDepth / kDepthOnly mode, and no depth test that always passes
+// without writing.
+reg::RB_DEPTHCONTROL NormalizedDepthControl(const gfx::RegisterFile& regs) {
+  const xenos::EdramMode mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  reg::RB_DEPTHCONTROL dc;
+  dc.value = 0;
+  if (mode != xenos::EdramMode::kColorDepth && mode != xenos::EdramMode::kDepthOnly) {
+    return dc;
+  }
+  dc = regs.Get<reg::RB_DEPTHCONTROL>();
+  if (dc.z_enable && !dc.z_write_enable && dc.zfunc == xenos::CompareFunction::kAlways) {
+    dc.z_enable = 0;
+  }
+  return dc;
+}
+
+// Stencil reference and masks: D3D12 has one set for both faces, so like the
+// SDK, the back-face set only when only back faces are drawn.
+reg::RB_STENCILREFMASK StencilRefMask(const gfx::RegisterFile& regs, reg::RB_DEPTHCONTROL dc, bool polygonal) {
+  const bool back = polygonal && dc.backface_enable && regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front;
+  reg::RB_STENCILREFMASK ref_mask;
+  ref_mask.value = regs[back ? gfx::XE_GPU_REG_RB_STENCILREFMASK_BF : gfx::XE_GPU_REG_RB_STENCILREFMASK];
+  return ref_mask;
+}
+
+D3D12_DEPTH_STENCILOP_DESC StencilOps(xenos::StencilOp fail, xenos::StencilOp depth_fail, xenos::StencilOp pass,
+                                      xenos::CompareFunction func) {
+  // Both enumerations list the same operations in the same order, from 0 / 1.
+  return {D3D12_STENCIL_OP(uint32_t(fail) + 1), D3D12_STENCIL_OP(uint32_t(depth_fail) + 1),
+          D3D12_STENCIL_OP(uint32_t(pass) + 1), D3D12_COMPARISON_FUNC(uint32_t(func) + 1)};
+}
+
 }  // namespace
 
 struct DrawPath::Impl {
@@ -221,6 +324,92 @@ struct DrawPath::Impl {
   D3D12_GPU_VIRTUAL_ADDRESS shared_gpu = 0;
   std::vector<uint64_t> uploaded_pages = std::vector<uint64_t>(kSharedMemorySize >> kPageShift >> 6);
   std::unordered_map<uint32_t, uint64_t> page_hashes;  // command-ring pages copied this frame
+  // --tenchuz_native_recheck_pages: hash of each static page when this frame
+  // uploaded it, and what the current draw is uploading (for the log).
+  std::unordered_map<uint32_t, uint64_t> static_page_hashes;
+  uint32_t upload_context = 0, upload_context_size = 0;
+  uint32_t stale_logged = 0;
+  // --tenchuz_native_check_late_writes: every guest range copied this frame
+  // (record index of the draw it was copied for), re-hashed at frame end.
+  struct CopyCheck {
+    uint32_t record, address, size;
+    uint64_t hash;
+    char kind;  // 'A' per-draw arena copy, 'S' static pages
+  };
+  std::vector<CopyCheck> copy_checks;
+  uint64_t trace_vs = 0;  // --tenchuz_native_trace_vs
+  uint64_t trace_frame = 0;
+
+  // One line per traced draw: every float constant the VS uses, per-component
+  // ranges of the first vertex stream's first 8 floats, and the index range.
+  void TraceDraw(uint8_t* base, const gfx::Shader& vs, const gfx::RegisterFile& regs, uint32_t vb_address,
+                 uint32_t vb_size, uint32_t vb_stride, uint32_t count, bool indexed, bool index32, uint32_t ib_base,
+                 xenos::Endian index_endian) {
+    std::string out = fmt::format("tenchuz: NATIVE trace frame {} vs {:016X} count {}", trace_frame,
+                                  vs.ucode_data_hash(), count);
+    const auto& map = vs.constant_register_map();
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t bits = map.float_bitmap[i];
+      uint32_t index;
+      while (rex::bit_scan_forward(bits, &index)) {
+        bits &= ~(1ull << index);
+        const uint32_t c = i * 64 + index;
+        float v[4];
+        std::memcpy(v, &regs.values[gfx::XE_GPU_REG_SHADER_CONSTANT_000_X + c * 4], 16);
+        out += fmt::format(" c{}=({:g},{:g},{:g},{:g})", c, v[0], v[1], v[2], v[3]);
+      }
+    }
+    const uint32_t vertices = vb_stride ? vb_size / vb_stride : 0;
+    if (vertices && vb_stride >= 4) {
+      const uint32_t comps = std::min(8u, vb_stride / 4);
+      float lo[8], hi[8];
+      uint32_t bad = 0;
+      for (uint32_t k = 0; k < comps; ++k) { lo[k] = 1e30f; hi[k] = -1e30f; }
+      for (uint32_t v = 0; v < vertices; ++v) {
+        for (uint32_t k = 0; k < comps; ++k) {
+          const uint32_t bits = REX_LOAD_U32(0xA0000000u | (vb_address + v * vb_stride + 4 * k));
+          float f;
+          std::memcpy(&f, &bits, 4);
+          if (!std::isfinite(f)) { ++bad; continue; }
+          lo[k] = std::min(lo[k], f);
+          hi[k] = std::max(hi[k], f);
+        }
+      }
+      out += fmt::format(" | vb {:08X} {} verts, non-finite {}:", vb_address, vertices, bad);
+      for (uint32_t k = 0; k < comps; ++k) out += fmt::format(" [{:g},{:g}]", lo[k], hi[k]);
+    }
+    if (indexed && count) {
+      uint32_t lo = UINT32_MAX, hi = 0, restarts = 0, beyond = 0;
+      for (uint32_t i = 0; i < count; ++i) {
+        uint32_t idx;
+        if (index32) {
+          idx = REX_LOAD_U32(0xA0000000u | (ib_base + 4 * i));  // big-endian load = k8in32
+        } else {
+          const uint8_t* b = REX_RAW_ADDR(0xA0000000u | (ib_base + 2 * i));
+          idx = index_endian == xenos::Endian::k8in16 ? uint32_t(b[0] << 8 | b[1]) : uint32_t(b[1] << 8 | b[0]);
+        }
+        if (idx == (index32 ? 0xFFFFFFFFu : 0xFFFFu)) { ++restarts; continue; }
+        lo = std::min(lo, idx);
+        hi = std::max(hi, idx);
+        if (idx >= vertices) ++beyond;
+      }
+      out += fmt::format(" | ib {:08X} {}-bit endian {} range [{},{}] restarts {} beyond-vb {}", ib_base,
+                         index32 ? 32 : 16, uint32_t(index_endian), lo, hi, restarts, beyond);
+    }
+    REXLOG_INFO("{}", out);
+  }
+  bool check_late_writes = false;
+  uint8_t* guest_base = nullptr;
+  void NoteCopy(uint8_t* base, uint32_t address, uint32_t size, char kind) {
+    if (!check_late_writes) return;
+    guest_base = base;
+    uint32_t record = 0;
+    {
+      std::lock_guard lock(records_mutex);
+      record = uint32_t(records[slot].size());
+    }
+    copy_checks.push_back({record, address, size, XXH3_64bits(REX_RAW_ADDR(0xA0000000u | address), size), kind});
+  }
 
   struct Frame {
     ComPtr<ID3D12Resource> constants;
@@ -254,6 +443,8 @@ struct DrawPath::Impl {
     const char* op;  // null for draws
     uint64_t vs, ps;
     uint32_t prim, count, indexed, ib_base, ib_size, vb_base, vb_size, vb_stride;
+    uint32_t arena;  // 1: vertices copied to the arena, 2: indices
+    uint32_t query;  // occlusion query index + 1 (--tenchuz_native_draw_queries), 0 = none
   };
   ComPtr<ID3D12Resource> breadcrumbs;
   volatile uint32_t* breadcrumbs_map = nullptr;  // [2 * slot] started, [2 * slot + 1] completed
@@ -261,10 +452,40 @@ struct DrawPath::Impl {
   ID3D12GraphicsCommandList* breadcrumb_list = nullptr;
   ComPtr<ID3D12GraphicsCommandList2> breadcrumb_list2;
   std::array<std::vector<DrawRecord>, kFrames> records;
+  // --tenchuz_native_draw_queries: samples each draw passed, resolved at the
+  // end of its frame and listed when the slot comes round again.
+  static constexpr uint32_t kQueriesPerFrame = 2048;
+  ComPtr<ID3D12QueryHeap> query_heap;
+  ComPtr<ID3D12Resource> query_readback;
+  const uint64_t* query_map = nullptr;
+  std::array<uint32_t, kFrames> queries_used{};
+  std::array<bool, kFrames> log_pending{};
+  std::array<uint64_t, kFrames> log_frame{};
+  std::array<uint64_t, kFrames> query_frame{};  // frame number of each slot's queries
   std::array<uint64_t, kFrames> record_frames{};
   uint64_t frame_counter = 0;
   std::mutex records_mutex;
   std::atomic<bool> hang_reported{false};
+
+  // Lists a finished frame slot's draws and operations in order.
+  void LogDraws(uint32_t s) {
+    std::lock_guard lock(records_mutex);
+    REXLOG_INFO("tenchuz: NATIVE draw list of frame {} ({} entries)", log_frame[s], records[s].size());
+    for (uint32_t i = 0; i < records[s].size(); ++i) {
+      const DrawRecord& r = records[s][i];
+      if (r.op) {
+        REXLOG_INFO("tenchuz: NATIVE #{} {} {:08X} {:08X}", i, r.op, r.prim, r.count);
+        continue;
+      }
+      const std::string samples =
+          r.query && query_map ? fmt::format(" samples {}", query_map[r.query - 1]) : std::string();
+      REXLOG_INFO("tenchuz: NATIVE #{} draw vs {:016X} ps {:016X} prim {} count {} {} ib {:08X}+{:X} vb {:08X}+{:X} "
+                  "stride {}{}{}{}",
+                  i, r.vs, r.ps, r.prim, r.count, r.indexed ? "indexed" : "auto", r.ib_base, r.ib_size,
+                  r.vb_base, r.vb_size, r.vb_stride, (r.arena & 1) ? " vb-arena" : "",
+                  (r.arena & 2) ? " ib-arena" : "", samples);
+    }
+  }
 
   // Records `record` and writes its "started" marker; returns its number.
   uint32_t MarkStart(ID3D12GraphicsCommandList* list, const DrawRecord& record) {
@@ -306,7 +527,7 @@ struct DrawPath::Impl {
   DrawStats stats;
   uint32_t logged_errors = 0;
 
-  bool Initialize(ID3D12Device* d) {
+  bool Initialize(ID3D12Device* d, rex::memory::Memory* memory) {
     device = d;
     serialize_root = reinterpret_cast<SerializeRootFn>(
         GetProcAddress(GetModuleHandleA("d3d12.dll"), "D3D12SerializeRootSignature"));
@@ -331,6 +552,7 @@ struct DrawPath::Impl {
                                                IID_PPV_ARGS(&shared)))) {
       return false;
     }
+    SetDebugName(shared.Get(), "tenchuz shared memory mirror + arenas");
     D3D12_RANGE none = {0, 0};
     shared->Map(0, &none, reinterpret_cast<void**>(&shared_map));
     shared_gpu = shared->GetGPUVirtualAddress();
@@ -342,6 +564,7 @@ struct DrawPath::Impl {
                                                  IID_PPV_ARGS(&f.constants)))) {
         return false;
       }
+      SetDebugName(f.constants.Get(), "tenchuz constant ring");
       f.constants->Map(0, &none, reinterpret_cast<void**>(&f.constants_map));
       f.constants_gpu = f.constants->GetGPUVirtualAddress();
     }
@@ -351,9 +574,11 @@ struct DrawPath::Impl {
     heap.NumDescriptors = 2 + kFrames * kViewRingSize;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&view_heap)))) return false;
+    SetDebugName(view_heap.Get(), "tenchuz draw view heap");
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
     heap.NumDescriptors = kSamplerHeapSize;
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&sampler_heap)))) return false;
+    SetDebugName(sampler_heap.Get(), "tenchuz draw sampler heap");
     heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heap.NumDescriptors = 3;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -402,6 +627,7 @@ struct DrawPath::Impl {
                                                  nullptr, IID_PPV_ARGS(&dummy_textures[i])))) {
         return false;
       }
+      SetDebugName(dummy_textures[i].Get(), "tenchuz placeholder texture");
       // Zeros, like the SDK's null texture descriptors (unused signed views,
       // textures that can't be loaded), so a missing texture is never white.
       D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
@@ -460,9 +686,26 @@ struct DrawPath::Impl {
       breadcrumbs->Map(0, &all, &mapped);
       breadcrumbs_map = static_cast<volatile uint32_t*>(mapped);
       breadcrumbs_gpu = breadcrumbs->GetGPUVirtualAddress();
+      SetDebugName(breadcrumbs.Get(), "tenchuz breadcrumbs");
     }
 
-    loader_ready = loader.Initialize(device, shared.Get(), kSharedMemorySize);
+    if (REXCVAR_GET(tenchuz_native_draw_queries)) {
+      D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, kQueriesPerFrame * kFrames, 0};
+      desc = buffer_desc(uint64_t(kQueriesPerFrame) * kFrames * 8);
+      if (SUCCEEDED(device->CreateQueryHeap(&qd, IID_PPV_ARGS(&query_heap))) &&
+          SUCCEEDED(device->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesReadback,
+                                                    D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                    nullptr, IID_PPV_ARGS(&query_readback)))) {
+        void* mapped = nullptr;
+        D3D12_RANGE all = {0, SIZE_T(desc.Width)};
+        query_readback->Map(0, &all, &mapped);
+        query_map = static_cast<const uint64_t*>(mapped);
+      } else {
+        query_heap.Reset();
+      }
+    }
+
+    loader_ready = loader.Initialize(device, shared.Get(), kSharedMemorySize, memory);
     if (!loader_ready) {
       REXLOG_WARN("tenchuz: N4 texture loader unavailable");
     }
@@ -537,19 +780,45 @@ struct DrawPath::Impl {
       }
       return;
     }
+    const int32_t recheck = REXCVAR_GET(tenchuz_native_recheck_pages);
     while (page < page_end) {
       if (uploaded_pages[page >> 6] & (1ull << (page & 63))) {
+        if (recheck > 0) {
+          // Already uploaded this frame: has the guest rewritten it since?
+          const uint32_t offset = page << kPageShift;
+          const uint8_t* guest = REX_RAW_ADDR(0xA0000000u | offset);
+          const uint64_t hash = XXH3_64bits(guest, kPageSize);
+          uint64_t& uploaded_hash = static_page_hashes[page];
+          if (hash != uploaded_hash) {
+            ++stats.stale_pages;
+            if (stale_logged++ < 6) {
+              REXLOG_INFO("tenchuz: N4 page {:08X} changed after its upload this frame (draw data {:08X} "
+                          "+{:X}{})",
+                          offset, upload_context, upload_context_size,
+                          host && host->InCommandRing(offset) ? ", command ring" : "");
+            }
+            if (recheck >= 2) {
+              std::memcpy(shared_map + offset, guest, kPageSize);
+              uploaded_hash = hash;
+              stats.uploaded_kb += kPageSize >> 10;
+            }
+          }
+        }
         ++page;
         continue;
       }
       const uint32_t run_start = page;
       while (page < page_end && !(uploaded_pages[page >> 6] & (1ull << (page & 63)))) {
         uploaded_pages[page >> 6] |= 1ull << (page & 63);
+        if (recheck > 0) {
+          static_page_hashes[page] = XXH3_64bits(REX_RAW_ADDR(0xA0000000u | (page << kPageShift)), kPageSize);
+        }
         ++page;
       }
       const uint32_t offset = run_start << kPageShift;
       const uint32_t bytes = (page - run_start) << kPageShift;
       std::memcpy(shared_map + offset, REX_RAW_ADDR(0xA0000000u | offset), bytes);
+      NoteCopy(base, offset, bytes, 'S');
       stats.uploaded_kb += bytes >> 10;
     }
   }
@@ -640,13 +909,29 @@ struct DrawPath::Impl {
                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE topology,
                                 D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut,
                                 gfx::vendored::GeometryShaderKey gs_key) {
-    const auto depth = regs.Get<reg::RB_DEPTHCONTROL>();
-    const uint32_t blend0 = regs[gfx::XE_GPU_REG_RB_BLENDCONTROL0];
-    const uint32_t color_mask = regs[gfx::XE_GPU_REG_RB_COLOR_MASK] & 0xF;
+    const bool polygonal = topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    const reg::RB_DEPTHCONTROL depth = NormalizedDepthControl(regs);
+    const reg::RB_STENCILREFMASK stencil = StencilRefMask(regs, depth, polygonal);
+    uint32_t blend[4] = {};
+    uint32_t rt_count = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (target.color_formats[i] != DXGI_FORMAT_UNKNOWN) {
+        rt_count = i + 1;
+        blend[i] = regs[kBlendControl[i]];
+      }
+    }
+    const RasterState raster = GetRasterState(regs, polygonal);
+    uint32_t slope_bits;
+    std::memcpy(&slope_bits, &raster.slope_scaled_depth_bias, 4);
     uint64_t key = XXH3_64bits(&shaders, sizeof(shaders));
-    const uint32_t state[] = {uint32_t(uintptr_t(root)), depth.value & 0x7E, blend0, color_mask,
-                              uint32_t(target.color_format), uint32_t(target.depth_format),
-                              uint32_t(topology), uint32_t(strip_cut), gs_key.key};
+    const uint32_t state[] = {uint32_t(uintptr_t(root)), depth.value, stencil.value & 0xFFFF00,
+                              blend[0], blend[1], blend[2], blend[3], target.color_mask,
+                              uint32_t(target.color_formats[0]), uint32_t(target.color_formats[1]),
+                              uint32_t(target.color_formats[2]), uint32_t(target.color_formats[3]),
+                              uint32_t(target.depth_format), uint32_t(topology), uint32_t(strip_cut), gs_key.key,
+                              uint32_t(raster.cull) | (uint32_t(raster.front_counter_clockwise) << 4) |
+                                  (uint32_t(raster.wireframe) << 5) | (uint32_t(raster.depth_clip) << 6),
+                              uint32_t(raster.depth_bias), slope_bits, target.samples};
     key ^= XXH3_64bits(state, sizeof(state)) * 0x9E3779B97F4A7C15ull;
     auto it = pipelines.find(key);
     if (it != pipelines.end()) {
@@ -665,33 +950,54 @@ struct DrawPath::Impl {
       const std::vector<uint32_t>* gs = GeometryShader(gs_key);
       desc.GS = {gs->data(), gs->size() * sizeof(uint32_t)};
     }
-    D3D12_RENDER_TARGET_BLEND_DESC& rt = desc.BlendState.RenderTarget[0];
-    const uint32_t src = blend0 & 0x1F, op = (blend0 >> 5) & 7, dst = (blend0 >> 8) & 0x1F;
-    const uint32_t asrc = (blend0 >> 16) & 0x1F, aop = (blend0 >> 21) & 7, adst = (blend0 >> 24) & 0x1F;
-    rt.BlendEnable = !(src == 1 && dst == 0 && op == 0 && asrc == 1 && adst == 0 && aop == 0);
-    rt.SrcBlend = BlendFactor(src);
-    rt.DestBlend = BlendFactor(dst);
-    rt.BlendOp = BlendOp(op);
-    rt.SrcBlendAlpha = AlphaBlendFactor(asrc);
-    rt.DestBlendAlpha = AlphaBlendFactor(adst);
-    rt.BlendOpAlpha = BlendOp(aop);
-    rt.RenderTargetWriteMask = UINT8(color_mask);
+    desc.BlendState.IndependentBlendEnable = rt_count > 1;
+    for (uint32_t i = 0; i < rt_count; ++i) {
+      desc.RTVFormats[i] = target.color_formats[i];
+      D3D12_RENDER_TARGET_BLEND_DESC& rt = desc.BlendState.RenderTarget[i];
+      rt.RenderTargetWriteMask = UINT8((target.color_mask >> (4 * i)) & 0xF);
+      if (target.color_formats[i] == DXGI_FORMAT_UNKNOWN || !rt.RenderTargetWriteMask) {
+        rt.RenderTargetWriteMask = 0;
+        continue;
+      }
+      const uint32_t b = blend[i];
+      const uint32_t src = b & 0x1F, op = (b >> 5) & 7, dst = (b >> 8) & 0x1F;
+      const uint32_t asrc = (b >> 16) & 0x1F, aop = (b >> 21) & 7, adst = (b >> 24) & 0x1F;
+      rt.BlendEnable = !(src == 1 && dst == 0 && op == 0 && asrc == 1 && adst == 0 && aop == 0);
+      rt.SrcBlend = BlendFactor(src);
+      rt.DestBlend = BlendFactor(dst);
+      rt.BlendOp = BlendOp(op);
+      rt.SrcBlendAlpha = AlphaBlendFactor(asrc);
+      rt.DestBlendAlpha = AlphaBlendFactor(adst);
+      rt.BlendOpAlpha = BlendOp(aop);
+    }
     desc.SampleMask = UINT_MAX;
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;  // culling comes in N4.4
-    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.RasterizerState.FillMode = raster.wireframe ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = raster.cull;
+    desc.RasterizerState.FrontCounterClockwise = raster.front_counter_clockwise;
+    desc.RasterizerState.DepthBias = raster.depth_bias;
+    desc.RasterizerState.SlopeScaledDepthBias = raster.slope_scaled_depth_bias;
+    desc.RasterizerState.DepthClipEnable = raster.depth_clip;
     if (target.depth_format != DXGI_FORMAT_UNKNOWN) {
-      desc.DepthStencilState.DepthEnable = depth.z_enable;
-      desc.DepthStencilState.DepthWriteMask =
-          depth.z_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-      desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(uint32_t(depth.zfunc) + 1);
+      D3D12_DEPTH_STENCIL_DESC& ds = desc.DepthStencilState;
+      ds.DepthEnable = depth.z_enable;
+      ds.DepthWriteMask = depth.z_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+      ds.DepthFunc = D3D12_COMPARISON_FUNC(uint32_t(depth.zfunc) + 1);
+      if (depth.stencil_enable) {
+        ds.StencilEnable = TRUE;
+        ds.StencilReadMask = UINT8(stencil.stencilmask);
+        ds.StencilWriteMask = UINT8(stencil.stencilwritemask);
+        ds.FrontFace = StencilOps(depth.stencilfail, depth.stencilzfail, depth.stencilzpass, depth.stencilfunc);
+        ds.BackFace = polygonal && depth.backface_enable
+                          ? StencilOps(depth.stencilfail_bf, depth.stencilzfail_bf, depth.stencilzpass_bf,
+                                       depth.stencilfunc_bf)
+                          : ds.FrontFace;
+      }
       desc.DSVFormat = target.depth_format;
     }
     desc.PrimitiveTopologyType = topology;
     desc.IBStripCutValue = strip_cut;
-    desc.NumRenderTargets = 1;
-    desc.RTVFormats[0] = target.color_format;
-    desc.SampleDesc.Count = 1;
+    desc.NumRenderTargets = rt_count;
+    desc.SampleDesc.Count = target.samples;
     ComPtr<ID3D12PipelineState> pso;
     const HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
     if (FAILED(hr)) {
@@ -747,8 +1053,14 @@ struct DrawPath::Impl {
       const uint32_t bits = REX_LOAD_U32(device_address + kDevVport + 4 * i);
       std::memcpy(&vp[i], &bits, 4);
     }
-    const float xs = vte.vport_x_scale_ena ? vp[0] : 1.0f, xo = vte.vport_x_offset_ena ? vp[1] : 0.0f;
-    const float ys = vte.vport_y_scale_ena ? vp[2] : 1.0f, yo = vte.vport_y_offset_ena ? vp[3] : 0.0f;
+    // Direct3D 9 pixel centres (at .0): half a pixel added to the offset, like
+    // the SDK's GetHostViewportInfo.
+    const float half_pixel =
+        regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+    const float xs = vte.vport_x_scale_ena ? vp[0] : 1.0f;
+    const float xo = (vte.vport_x_offset_ena ? vp[1] : 0.0f) + half_pixel;
+    const float ys = vte.vport_y_scale_ena ? vp[2] : 1.0f;
+    const float yo = (vte.vport_y_offset_ena ? vp[3] : 0.0f) + half_pixel;
     const float zs = vte.vport_z_scale_ena ? vp[4] : 1.0f, zo = vte.vport_z_offset_ena ? vp[5] : 0.0f;
     const float w = float(target.width), h = float(target.height);
     sc.ndc_scale[0] = xs * 2.0f / w;
@@ -762,16 +1074,20 @@ struct DrawPath::Impl {
     const uint32_t alpha_ref_bits = regs[gfx::XE_GPU_REG_RB_ALPHA_REF];
     std::memcpy(&alpha_ref, &alpha_ref_bits, 4);
     sc.alpha_test_reference = alpha_ref;
-    // RT0 colour info from the device: the decoded value is stale in tiled passes.
-    reg::RB_COLOR_INFO color_info;
-    color_info.value = REX_LOAD_U32(device_address + kDevColorInfo);
-    const int32_t exp_bias = int32_t(color_info.value << 6) >> 26;  // bits 20-25, signed
-    for (float& bias : sc.color_exp_bias) {
-      bias = std::ldexp(1.0f, exp_bias);
-    }
-    // Gamma render targets are plain 8-bit UNORM here: the shader encodes.
-    if (color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
-      sc.flags |= Translator::kSysFlag_ConvertColor0ToGamma;
+    // Like the SDK's system constants: alpha to coverage (the shader writes the
+    // sample mask) and the host sample count.
+    sc.alpha_to_mask = color_control.alpha_to_mask_enable ? (color_control.value >> 24) | (1 << 8) : 0;
+    sc.sample_count_log2[0] = target.samples >= 4 ? 1 : 0;
+    sc.sample_count_log2[1] = target.samples >= 2 ? 1 : 0;
+    // Per render target: 2^exp_bias scale, and gamma targets are plain 8-bit
+    // UNORM here, so the shader encodes.
+    for (uint32_t i = 0; i < 4; ++i) {
+      const reg::RB_COLOR_INFO color_info = DeviceColorInfo(base, device_address, i);
+      const int32_t exp_bias = int32_t(color_info.value << 6) >> 26;  // bits 20-25, signed
+      sc.color_exp_bias[i] = std::ldexp(1.0f, exp_bias);
+      if (color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+        sc.flags |= Translator::kSysFlag_ConvertColor0ToGamma << i;
+      }
     }
   }
 
@@ -819,13 +1135,15 @@ struct DrawPath::Impl {
   }
 
   // Writes an SRV for one shader texture binding at `cpu`: a resolved render
-  // target, else a loaded guest texture. False if neither fits the binding.
+  // target, else a loaded guest texture. False if neither fits the binding,
+  // with the reason.
   bool BindTexture(const gfx::DxbcShader::TextureBinding& binding, const gfx::RegisterFile& regs,
                    ID3D12GraphicsCommandList* list, DrawHost* textures, uint8_t* base,
-                   D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
+                   D3D12_CPU_DESCRIPTOR_HANDLE cpu, PlaceholderReason& reason) {
     const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
     if (fetch.type != xenos::FetchConstantType::kTexture &&
         fetch.type != xenos::FetchConstantType::kInvalidTexture) {
+      reason = kPlaceholderNotTexture;
       return false;
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC view = {};
@@ -845,15 +1163,27 @@ struct DrawPath::Impl {
       }
     }
     if (!loader_ready) {
+      reason = kPlaceholderLoadFailed;
       return false;
     }
     TextureLoader::Texture texture;
-    if (!loader.Get(list, fetch, base, [this, base](uint32_t physical, uint32_t size) { Upload(base, physical, size); },
-                    texture)) {
-      return false;
+    switch (loader.Get(list, fetch, base,
+                       [this, base](uint32_t physical, uint32_t size) { Upload(base, physical, size); }, texture)) {
+      case TextureLoader::Result::kLoaded:
+        break;
+      case TextureLoader::Result::kNoAddress:
+        reason = kPlaceholderNoAddress;
+        return false;
+      case TextureLoader::Result::kUnsupported:
+        reason = kPlaceholderUnsupported;
+        return false;
+      default:
+        reason = kPlaceholderLoadFailed;
+        return false;
     }
     view.Format = binding.is_signed ? texture.format_signed : texture.format_unsigned;
     if (view.Format == DXGI_FORMAT_UNKNOWN) {
+      reason = binding.is_signed ? kPlaceholderSignedView : kPlaceholderUnsupported;
       return false;
     }
     view.Shader4ComponentMapping = GuestToHostSwizzle(fetch.swizzle, texture.host_format_swizzle) |
@@ -864,6 +1194,7 @@ struct DrawPath::Impl {
       case xenos::FetchOpDimension::k1D:
       case xenos::FetchOpDimension::k2D:
         if (is_3d) {
+          reason = kPlaceholderDimension;
           return false;
         }
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -872,13 +1203,15 @@ struct DrawPath::Impl {
         break;
       case xenos::FetchOpDimension::k3DOrStacked:
         if (!is_3d) {
-          return false;  // stacked 2D sampled as 3D: SDK 3D-as-2D wrapper, not ported
+          reason = kPlaceholderStacked3D;  // the SDK's 3D-as-2D wrapper isn't ported
+          return false;
         }
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
         view.Texture3D.MipLevels = texture.mip_levels;
         break;
       case xenos::FetchOpDimension::kCube:
         if (!is_cube) {
+          reason = kPlaceholderDimension;
           return false;
         }
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
@@ -903,6 +1236,7 @@ struct DrawPath::Impl {
     f.arena_used = offset + size;
     const uint64_t buffer_offset = kSharedMemorySize + uint64_t(slot) * kArenaSize + offset;
     std::memcpy(shared_map + buffer_offset, REX_RAW_ADDR(0xA0000000u | physical), size);
+    NoteCopy(base, physical, size, 'A');
     stats.arena_kb += (size + 1023) >> 10;
     return buffer_offset;
   }
@@ -960,11 +1294,21 @@ struct DrawPath::Impl {
     gpu = view_heap->GetGPUDescriptorHandleForHeapStart();
     gpu.ptr += UINT64(first) * view_inc;
     for (const auto& binding : bindings) {
-      if (BindTexture(binding, regs, list, textures, base, cpu)) {
-        cpu.ptr += view_inc;
-        continue;
+      // The signed binding of a fetch is only sampled for its signed
+      // components: with none, it gets the placeholder without a texture
+      // lookup or load (like the SDK, which loads signed views only then).
+      if (binding.is_signed &&
+          !gfx::texture_util::IsAnySignSigned(gfx::texture_util::SwizzleSigns(regs.GetTextureFetch(binding.fetch_constant)))) {
+        ++stats.signed_unused;
+      } else {
+        PlaceholderReason reason = kPlaceholderLoadFailed;
+        if (BindTexture(binding, regs, list, textures, base, cpu, reason)) {
+          cpu.ptr += view_inc;
+          continue;
+        }
+        ++stats.textures_missing;
+        ++stats.placeholders[reason];
       }
-      ++stats.textures_missing;
       uint32_t dummy = 0;
       if (binding.dimension == xenos::FetchOpDimension::k3DOrStacked) dummy = 1;
       if (binding.dimension == xenos::FetchOpDimension::kCube) dummy = 2;
@@ -981,12 +1325,60 @@ struct DrawPath::Impl {
 DrawPath::DrawPath() : impl_(std::make_unique<Impl>()) {}
 DrawPath::~DrawPath() = default;
 
-bool DrawPath::Initialize(ID3D12Device* device) {
-  return impl_->Initialize(device);
+bool DrawPath::Initialize(ID3D12Device* device, rex::memory::Memory* memory) {
+  return impl_->Initialize(device, memory);
+}
+
+uint32_t DrawPath::WrittenColorMask(const pm4::Decoder& state, uint8_t* base, uint32_t device_address,
+                                    const DrawShaders& shaders) {
+  const auto& regs = *reinterpret_cast<const gfx::RegisterFile*>(state.regs);
+  if (!shaders.pixel || regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth) {
+    return 0;
+  }
+  const uint32_t writes = shaders.pixel->shader().writes_color_targets();
+  const uint32_t rb_color_mask = regs[gfx::XE_GPU_REG_RB_COLOR_MASK];
+  uint32_t mask = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!(writes & (1u << i))) {
+      continue;
+    }
+    const uint32_t components =
+        (1u << xenos::GetColorRenderTargetFormatComponentCount(DeviceColorInfo(base, device_address, i).color_format)) -
+        1;
+    const uint32_t rt_mask = (rb_color_mask >> (4 * i)) & components;
+    if (rt_mask) {
+      // Components the format lacks count as written (no read-merge path).
+      mask |= (rt_mask | (0xF & ~components)) << (4 * i);
+    }
+  }
+  return mask;
 }
 
 void DrawPath::BeginFrame(uint32_t slot) {
   impl_->slot = slot % kFrames;
+  if (impl_->log_pending[impl_->slot]) {
+    impl_->log_pending[impl_->slot] = false;
+    impl_->LogDraws(impl_->slot);  // the slot's GPU work has finished: query results are in
+  }
+  if (const int32_t threshold = REXCVAR_GET(tenchuz_native_log_coverage);
+      threshold > 0 && impl_->query_map && impl_->queries_used[impl_->slot]) {
+    std::lock_guard lock(impl_->records_mutex);
+    std::string big;
+    const auto& records = impl_->records[impl_->slot];
+    for (uint32_t i = 0; i < records.size(); ++i) {
+      if (records[i].query && impl_->query_map[records[i].query - 1] > uint64_t(threshold)) {
+        big += fmt::format(" #{}:{}", i, impl_->query_map[records[i].query - 1]);
+      }
+    }
+    REXLOG_INFO("tenchuz: NATIVE coverage frame {}:{}", impl_->query_frame[impl_->slot], big);
+  }
+  impl_->queries_used[impl_->slot] = 0;
+  impl_->copy_checks.clear();
+  {
+    const std::string trace = REXCVAR_GET(tenchuz_native_trace_vs);
+    impl_->trace_vs = trace.empty() ? 0 : std::strtoull(trace.c_str(), nullptr, 16);
+  }
+  impl_->check_late_writes = REXCVAR_GET(tenchuz_native_check_late_writes);
   {
     std::lock_guard lock(impl_->records_mutex);
     impl_->records[impl_->slot].clear();
@@ -1001,8 +1393,42 @@ void DrawPath::BeginFrame(uint32_t slot) {
   impl_->frames[impl_->slot].arena_used = 0;
   std::fill(impl_->uploaded_pages.begin(), impl_->uploaded_pages.end(), 0);
   impl_->page_hashes.clear();
+  impl_->static_page_hashes.clear();
+  impl_->stale_logged = 0;
   if (impl_->loader_ready) {
     impl_->loader.BeginFrame(slot);
+  }
+}
+
+void DrawPath::LogFrameDraws(uint64_t frame) {
+  impl_->log_pending[impl_->slot] = true;
+  impl_->log_frame[impl_->slot] = frame;
+}
+
+void DrawPath::EndFrame(ID3D12GraphicsCommandList* list, uint64_t frame) {
+  Impl& m = *impl_;
+  m.trace_frame = frame + 1;
+  m.query_frame[m.slot] = frame;
+  if (m.check_late_writes && !m.copy_checks.empty() && m.guest_base) {
+    uint8_t* base = m.guest_base;
+    uint32_t changed = 0, changed_kb = 0;
+    for (const Impl::CopyCheck& c : m.copy_checks) {
+      if (XXH3_64bits(REX_RAW_ADDR(0xA0000000u | c.address), c.size) == c.hash) continue;
+      if (changed++ < 12) {
+        REXLOG_INFO("tenchuz: NATIVE frame {} late write: draw #{} {} {:08X}+{:X} changed after it was copied",
+                    frame, c.record, c.kind == 'A' ? "arena" : "static", c.address, c.size);
+      }
+      changed_kb += (c.size + 1023) >> 10;
+    }
+    if (changed) {
+      REXLOG_INFO("tenchuz: NATIVE frame {}: {} of {} copied ranges ({} KB) changed after they were copied", frame,
+                  changed, m.copy_checks.size(), changed_kb);
+    }
+  }
+  if (m.query_heap && m.queries_used[m.slot]) {
+    const uint32_t first = m.slot * Impl::kQueriesPerFrame;
+    list->ResolveQueryData(m.query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, first, m.queries_used[m.slot],
+                           m.query_readback.Get(), uint64_t(first) * 8);
   }
 }
 
@@ -1060,6 +1486,7 @@ DrawStats DrawPath::TakeFrameStats() {
     s.texture_hashed_kb = t.hashed_kb;
     s.texture_unsupported = t.unsupported;
     s.textures_cached = t.textures;
+    s.texture_written_pages = t.written_pages;
   }
   return s;
 }
@@ -1126,6 +1553,13 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
       m.stats.skipped_primitive_types |= 1u << (uint32_t(prim) & 31);
       return false;
   }
+  if (topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
+    const auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+    if (mode.cull_front && mode.cull_back) {
+      ++m.stats.skipped_culled;  // nothing rasterized (memexport isn't supported)
+      return false;
+    }
+  }
   const uint32_t count = initiator.num_indices;
   const bool indexed = initiator.source_select == xenos::SourceSelect::kDMA;
   if (!count || (indexed && !dma_packet) ||
@@ -1168,6 +1602,7 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   record.prim = uint32_t(prim);
   record.count = count;
   record.indexed = indexed;
+  record.arena = vertices_in_arena ? 1 : 0;
   for (const auto& binding : vs_shader.vertex_bindings()) {
     const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(binding.fetch_constant);
     if (fetch.type != xenos::FetchConstantType::kVertex &&
@@ -1175,6 +1610,8 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
       continue;  // not a vertex buffer: nothing sensible to copy
     }
     if (!vertices_in_arena) {
+      m.upload_context = fetch.address << 2;
+      m.upload_context_size = fetch.size << 2;
       m.Upload(base, fetch.address << 2, fetch.size << 2, host);
     }
     if (!record.vb_size) {
@@ -1200,19 +1637,62 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
       ib_arena = m.CopyToArena(base, ib_base & 0x1FFFFFFFu, ib_size);  // dynamic indices
     }
     if (!ib_arena) {
+      m.upload_context = ib_base;
+      m.upload_context_size = ib_size;
       m.Upload(base, ib_base, ib_size, host);
     }
     record.ib_base = ib_base;
     record.ib_size = ib_size;
+    record.arena |= ib_arena ? 2 : 0;
     ibv.BufferLocation = m.shared_gpu + (ib_arena ? ib_arena : (ib_base & 0x1FFFFFFFu));
     ibv.SizeInBytes = ib_size;
     ibv.Format = index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-    // Primitive reset with the all-ones index (the same bytes in either order).
+    // Primitive reset. The guest's reset index is VGT_MULTI_PRIM_IB_RESET_INDX
+    // (low 24 bits, compared after the endian swap); the host only cuts strips
+    // at all-ones (the same bytes in either order). The water in the Ninja
+    // Village resets 32-bit strips with 0xFFFF: other values are rewritten to
+    // all-ones in a copy of the indices (like the SDK's primitive processor).
     if ((prim == xenos::PrimitiveType::kTriangleStrip || prim == xenos::PrimitiveType::kLineStrip) &&
         regs.Get<reg::PA_SU_SC_MODE_CNTL>().multi_prim_ib_ena) {
-      strip_cut = index32 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
-                          : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+      const uint32_t reset = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+      if (index32 || reset <= 0xFFFF) {
+        strip_cut = index32 ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF
+                            : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+      }
+      if (strip_cut != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED && reset != (index32 ? 0xFFFFFFu : 0xFFFFu)) {
+        D3D12_GPU_VIRTUAL_ADDRESS converted_gpu;
+        auto* out = count ? static_cast<uint8_t*>(m.AllocConstants(count * index_bytes, converted_gpu)) : nullptr;
+        if (!out) {
+          ++m.stats.skipped_other;
+          return false;
+        }
+        const uint8_t* guest = REX_RAW_ADDR(0xA0000000u | ib_base);
+        for (uint32_t i = 0; i < count; ++i, guest += index_bytes, out += index_bytes) {
+          uint32_t raw;
+          if (index32) {
+            std::memcpy(&raw, guest, 4);
+            if ((xenos::GpuSwap(raw, index_endian) & 0xFFFFFF) == reset) {
+              raw = 0xFFFFFFFFu;
+            }
+            std::memcpy(out, &raw, 4);
+          } else {
+            uint16_t raw16;
+            std::memcpy(&raw16, guest, 2);
+            if (xenos::GpuSwap(raw16, index_endian) == reset) {
+              raw16 = 0xFFFF;
+            }
+            std::memcpy(out, &raw16, 2);
+          }
+        }
+        ibv.BufferLocation = converted_gpu;
+        ibv.SizeInBytes = count * index_bytes;
+        ++m.stats.reset_converted;
+      }
     }
+  }
+  if (m.trace_vs && vs_shader.ucode_data_hash() == m.trace_vs) {
+    m.TraceDraw(base, vs_shader, regs, record.vb_base, record.vb_size, record.vb_stride, count, indexed, index32,
+                ib_base, index_endian);
   }
   uint32_t draw_count = count;
   bool use_index_buffer = indexed;
@@ -1368,13 +1848,35 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   if (vs_textures) list->SetGraphicsRootDescriptorTable(param++, vs_table);
   if (vs_samplers) list->SetGraphicsRootDescriptorTable(param++, m.SamplerTable(vs_shader, regs));
 
-  list->OMSetRenderTargets(1, &target.rtv, FALSE,
+  uint32_t rt_count = 0, rt_bound = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (target.color_formats[i] != DXGI_FORMAT_UNKNOWN) {
+      rt_count = i + 1;
+      ++rt_bound;
+    }
+  }
+  m.stats.mrt_draws += rt_bound > 1;
+  list->OMSetRenderTargets(rt_count, rt_count ? target.rtvs : nullptr, FALSE,
                            target.depth_format != DXGI_FORMAT_UNKNOWN ? &target.dsv : nullptr);
+  if (target.depth_format != DXGI_FORMAT_UNKNOWN) {
+    const reg::RB_DEPTHCONTROL depth = NormalizedDepthControl(regs);
+    if (depth.stencil_enable) {
+      list->OMSetStencilRef(
+          StencilRefMask(regs, depth, topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE).stencilref);
+      ++m.stats.stencil_draws;
+    }
+  }
   const D3D12_VIEWPORT viewport = {0, 0, float(target.width), float(target.height), 0.0f, 1.0f};
   const D3D12_RECT scissor = {0, 0, LONG(target.width), LONG(target.height)};
   list->RSSetViewports(1, &viewport);
   list->RSSetScissorRects(1, &scissor);
   list->IASetPrimitiveTopology(topology);
+  uint32_t query = 0;
+  if (m.query_heap && m.queries_used[m.slot] < Impl::kQueriesPerFrame) {
+    query = m.slot * Impl::kQueriesPerFrame + m.queries_used[m.slot]++;
+    record.query = query + 1;
+    list->BeginQuery(m.query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, query);
+  }
   // Breadcrumbs around the draw: started (top of pipe), completed (bottom).
   const uint32_t draw_number = m.MarkStart(list, record);
   if (use_index_buffer) {
@@ -1384,6 +1886,9 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
     list->DrawInstanced(count, 1, 0, 0);
   }
   m.MarkEnd(draw_number);
+  if (record.query) {
+    list->EndQuery(m.query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, query);
+  }
   ++m.stats.issued;
   return true;
 }
