@@ -20,6 +20,7 @@ public static class W {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
 }
 "@
 [W]::SetProcessDPIAware() | Out-Null
@@ -39,7 +40,7 @@ foreach ($t in ($Shots | Sort-Object)) {
   if ($h -ne [IntPtr]::Zero -and [W]::GetWindowRect($h, [ref]$r) -and ($r.R - $r.L) -gt 0) {
     $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
+    $hdc = $g.GetHdc(); [void][W]::PrintWindow($h, $hdc, 2); $g.ReleaseHdc($hdc)
     $png = Join-Path $root "logs\${Name}_${t}s.png"
     $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
     $g.Dispose(); $bmp.Dispose()

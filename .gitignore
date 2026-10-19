@@ -20,3 +20,6 @@ build/
 third_party/
 logs/
 *.log
+
+# Python bytecode
+__pycache__/

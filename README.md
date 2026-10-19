@@ -17,6 +17,7 @@ original `default.xex` to C++ with the [ReXGlue SDK](https://github.com/rexglue/
 | `tools/` | `xiso.py` (disc extractor), `xex_extract.py` (XEX→PE), `dis.sh` (PPC disassembly), `find_data_funcs.py` (pointer-only function recovery), `salvage_copy.py` (resumable copy plus SHA-1 check), `run_capture.ps1` / `contact_sheet.ps1` (test runs with screenshots), `disk_usage.ps1` |
 | `user/` | Saves and the shader cache, created at runtime (git-ignored) |
 | `docs/` | [RESEARCH.md](docs/RESEARCH.md), [ROADMAP.md](docs/ROADMAP.md), disc listing, Xenia import list |
+| `external/xenos_shader/` | Xenos→DXBC shader translator, geometry shaders, texture layout code and texture load shaders, vendored from the ReXGlue SDK (BSD-3) for the native renderer |
 | `third_party/` | ReXGlue SDK source, prebuilt binaries, and wiki (git-ignored) |
 
 ## Requirements (Windows)

@@ -18,3 +18,11 @@ longjmp_address = 0x826578C0
 0x825164A8 = { size = 0x28 }
 # Leaf FP math routine (fabs/fsel core, r4 = mode flag), reached from 0x82655E60
 0x82655CA0 = { size = 0xF4 }
+
+# Native renderer (N3): right after D3D Swap calls VdSwap. r29 + 4 is the
+# 64-dword ring block VdSwap filled; the hook NOPs the emulator's swap packet
+# while native output is on (src/renderer/native_renderer.cpp).
+[[midasm_hook]]
+name = "TenchuzAfterVdSwap"
+address = 0x8241C0E0
+registers = ["r29"]
