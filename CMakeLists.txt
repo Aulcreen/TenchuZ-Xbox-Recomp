@@ -17,6 +17,8 @@ set(TENCHUZ_SOURCES
     src/frame_stats.cpp
     src/profile_fix.cpp
     src/widescreen.cpp
+    src/net/system_link.cpp
+    src/net/transport_local.cpp
     src/renderer/d3d_trace.cpp
     src/renderer/d3d_trace_hooks.gen.cpp
     src/renderer/draw_path.cpp
@@ -35,6 +37,30 @@ else()
 endif()
 
 rexglue_setup_target(tenchuz GPU_PLUGINS xenos)
+if(WIN32)
+    target_link_libraries(tenchuz PRIVATE ws2_32)
+endif()
+
+# System Link over Steam, when the Steamworks SDK (the zip's sdk folder) is in
+# third_party/steamworks. steam_api64.dll is delay-loaded, so the game still
+# starts without it (src/net/transport_steam.cpp).
+set(TENCHUZ_STEAMWORKS_DIR "${CMAKE_SOURCE_DIR}/third_party/steamworks" CACHE PATH "Steamworks SDK folder")
+if(NOT EXISTS "${TENCHUZ_STEAMWORKS_DIR}/public" AND EXISTS "${TENCHUZ_STEAMWORKS_DIR}/sdk/public")
+    set(TENCHUZ_STEAMWORKS_DIR "${TENCHUZ_STEAMWORKS_DIR}/sdk")  # the zip's sdk folder itself
+endif()
+if(WIN32 AND EXISTS "${TENCHUZ_STEAMWORKS_DIR}/public/steam/steam_api.h")
+    set(steam_bin "${TENCHUZ_STEAMWORKS_DIR}/redistributable_bin/win64")
+    target_sources(tenchuz PRIVATE src/net/transport_steam.cpp)
+    target_compile_definitions(tenchuz PRIVATE TENCHUZ_STEAM=1)
+    target_include_directories(tenchuz SYSTEM PRIVATE "${TENCHUZ_STEAMWORKS_DIR}/public")
+    target_link_libraries(tenchuz PRIVATE "${steam_bin}/steam_api64.lib" delayimp)
+    target_link_options(tenchuz PRIVATE "LINKER:/DELAYLOAD:steam_api64.dll")
+    add_custom_command(TARGET tenchuz POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${steam_bin}/steam_api64.dll" "$<TARGET_FILE_DIR:tenchuz>")
+    message(STATUS "tenchuz: Steamworks SDK found, System Link over Steam is on")
+else()
+    message(STATUS "tenchuz: no Steamworks SDK in ${TENCHUZ_STEAMWORKS_DIR}, System Link is local only")
+endif()
 
 # Xenos -> DXBC shader translator and texture layout utilities for the native
 # renderer, vendored from the ReXGlue SDK at the commit our SDK binaries were

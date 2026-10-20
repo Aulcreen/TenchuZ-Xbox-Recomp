@@ -45,8 +45,10 @@ The goal is a native Windows (later Linux) executable built by statically recomp
 - [ ] Settings UI (ImGui overlay from the SDK), config file, and launcher
 - [ ] Optimization flags (`cr_as_local`, `non_volatile_as_local`, …) once the build is stable
 - [ ] Linux (Vulkan) build
-- [ ] Multiplayer: explore Steamworks (lobbies, matchmaking, networking) to replace the Xbox Live
-      modes. Start only after the renderer is fully native and the open rendering issues are fixed.
+- [ ] Multiplayer: System Link over a virtual LAN, over Steam lobbies and P2P (App ID 480) or
+      loopback between local instances (`docs/MULTIPLAYER.md`). Local co-op works up to a
+      shared mission. Steam builds, opens a lobby and hosts; a second player joining over Steam
+      is untested (needs two PCs). Xbox LIVE modes are not covered.
 
 ## Phase 4: Distribution
 - [ ] Installer flow: user points at their ISO, then we extract it and verify the XEX hash
