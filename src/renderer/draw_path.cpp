@@ -48,6 +48,9 @@ REXCVAR_DEFINE_BOOL(tenchuz_native_draw_queries, false, "tenchuz",
                     "Native draws: occlusion query per draw, listed with tenchuz_native_log_draws");
 REXCVAR_DEFINE_BOOL(tenchuz_native_debug_textures, false, "tenchuz",
                     "Native draws sample a UV-gradient checker instead of white (geometry check)");
+REXCVAR_DEFINE_BOOL(tenchuz_native_log_offscreen, false, "tenchuz",
+                    "Native draws: log screen-space draws (vertex shaders without float constants) whose "
+                    "vertices reach far off screen or aren't finite");
 
 namespace tenchuz::native {
 
@@ -235,7 +238,20 @@ struct RasterState {
   float slope_scaled_depth_bias = 0.0f;
 };
 
-RasterState GetRasterState(const gfx::RegisterFile& regs, bool polygonal) {
+// The driver's DXBC conversion has crashed (a null read) on a pipeline whose
+// shaders came from a mis-decoded load that still translated: such a pipeline
+// fails (E_UNEXPECTED) instead of taking the game down.
+HRESULT CreatePipelineGuarded(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
+                              ID3D12PipelineState** out) {
+  __try {
+    return device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(out));
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *out = nullptr;
+    return E_UNEXPECTED;
+  }
+}
+
+RasterState GetRasterState(const gfx::RegisterFile& regs, bool polygonal, uint32_t resolution_scale) {
   RasterState r;
   const auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
   float scale = 0.0f, offset = 0.0f;
@@ -262,7 +278,9 @@ RasterState GetRasterState(const gfx::RegisterFile& regs, bool polygonal) {
   // D32_FLOAT, where a unit is 2^(exponent of the primitive's max z - 23):
   // the same as unorm24's for z in [0.5, 1), smaller nearer the camera.
   r.depth_bias = gfx::draw_util::GetD3D10IntegerPolygonOffset(regs.Get<reg::RB_DEPTH_INFO>().depth_format, offset);
-  r.slope_scaled_depth_bias = scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+  // The slope is per host pixel: scaled up like the SDK's ROV path, so the
+  // bias stays what it is per guest pixel at a resolution scale.
+  r.slope_scaled_depth_bias = scale * xenos::kPolygonOffsetScaleSubpixelUnit * float(resolution_scale);
   r.depth_clip = !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
   return r;
 }
@@ -339,6 +357,7 @@ struct DrawPath::Impl {
   std::vector<CopyCheck> copy_checks;
   uint64_t trace_vs = 0;  // --tenchuz_native_trace_vs
   uint64_t trace_frame = 0;
+  bool log_offscreen = false;  // --tenchuz_native_log_offscreen
 
   // One line per traced draw: every float constant the VS uses, per-component
   // ranges of the first vertex stream's first 8 floats, and the index range.
@@ -445,7 +464,46 @@ struct DrawPath::Impl {
     uint32_t prim, count, indexed, ib_base, ib_size, vb_base, vb_size, vb_stride;
     uint32_t arena;  // 1: vertices copied to the arena, 2: indices
     uint32_t query;  // occlusion query index + 1 (--tenchuz_native_draw_queries), 0 = none
+    uint32_t target_width, target_height, samples;  // host pixels
+    uint32_t guest_textures, resolved_textures;
+    bool depth_test, hud;  // hud: kept at 16:9 (DrawTarget::hud_scale_x)
+    float ndc_scale[2], ndc_offset[2];
+    uint32_t vs_constants_hash;  // of the packed VS float constants
+    uint32_t packet;             // guest address of the draw packet
+    uint32_t color_info, depth_info, color_surface, depth_surface;  // DrawTarget diagnostics
   };
+
+  // --tenchuz_native_log_offscreen: the x / y range of a screen-space draw's
+  // vertices (the first two floats of each), logged when it reaches more than
+  // 256 pixels off a 1280x720 screen or isn't finite.
+  void LogOffscreen(uint8_t* base, const DrawRecord& r) {
+    const uint32_t vertices = std::min(r.vb_size / r.vb_stride, 4096u);
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+    uint32_t bad = 0;
+    for (uint32_t v = 0; v < vertices; ++v) {
+      for (uint32_t k = 0; k < 3 && 4 * k + 4 <= r.vb_stride; ++k) {
+        const uint32_t bits = REX_LOAD_U32(0xA0000000u | (r.vb_base + v * r.vb_stride + 4 * k));
+        float f;
+        std::memcpy(&f, &bits, 4);
+        if (!std::isfinite(f)) {
+          ++bad;
+          continue;
+        }
+        lo[k] = std::min(lo[k], f);
+        hi[k] = std::max(hi[k], f);
+      }
+    }
+    if (!bad && lo[0] >= -256.0f && hi[0] <= 1536.0f && lo[1] >= -256.0f && hi[1] <= 976.0f) {
+      return;
+    }
+    REXLOG_INFO("tenchuz: NATIVE offscreen frame {} vs {:016X} ps {:016X} prim {} count {} vb {:08X}+{:X} stride {}; "
+                "target {}x{} x{}{}{}, textures {} game {} resolved; x [{:g},{:g}] y [{:g},{:g}] z [{:g},{:g}], "
+                "{} not finite",
+                trace_frame, r.vs, r.ps, r.prim, r.count, r.vb_base, r.vb_size, r.vb_stride, r.target_width,
+                r.target_height, r.samples, r.depth_test ? " depth" : "", r.hud ? " hud" : "", r.guest_textures,
+                r.resolved_textures, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], bad);
+  }
+
   ComPtr<ID3D12Resource> breadcrumbs;
   volatile uint32_t* breadcrumbs_map = nullptr;  // [2 * slot] started, [2 * slot + 1] completed
   D3D12_GPU_VIRTUAL_ADDRESS breadcrumbs_gpu = 0;
@@ -480,10 +538,14 @@ struct DrawPath::Impl {
       const std::string samples =
           r.query && query_map ? fmt::format(" samples {}", query_map[r.query - 1]) : std::string();
       REXLOG_INFO("tenchuz: NATIVE #{} draw vs {:016X} ps {:016X} prim {} count {} {} ib {:08X}+{:X} vb {:08X}+{:X} "
-                  "stride {}{}{}{}",
+                  "stride {}{}{}{}; target {}x{} x{}{}, textures {} game {} resolved{}; ndc {:g} {:g} {:g} {:g}, "
+                  "vs constants {:08X}, packet {:08X}, rt {:08X} #{} depth {:08X} #{}",
                   i, r.vs, r.ps, r.prim, r.count, r.indexed ? "indexed" : "auto", r.ib_base, r.ib_size,
                   r.vb_base, r.vb_size, r.vb_stride, (r.arena & 1) ? " vb-arena" : "",
-                  (r.arena & 2) ? " ib-arena" : "", samples);
+                  (r.arena & 2) ? " ib-arena" : "", samples, r.target_width, r.target_height, r.samples,
+                  r.depth_test ? " depth" : "", r.guest_textures, r.resolved_textures, r.hud ? ", hud" : "",
+                  r.ndc_scale[0], r.ndc_scale[1], r.ndc_offset[0], r.ndc_offset[1], r.vs_constants_hash, r.packet,
+                  r.color_info, r.color_surface, r.depth_info, r.depth_surface);
     }
   }
 
@@ -920,7 +982,7 @@ struct DrawPath::Impl {
         blend[i] = regs[kBlendControl[i]];
       }
     }
-    const RasterState raster = GetRasterState(regs, polygonal);
+    const RasterState raster = GetRasterState(regs, polygonal, target.resolution_scale);
     uint32_t slope_bits;
     std::memcpy(&slope_bits, &raster.slope_scaled_depth_bias, 4);
     uint64_t key = XXH3_64bits(&shaders, sizeof(shaders));
@@ -999,7 +1061,7 @@ struct DrawPath::Impl {
     desc.NumRenderTargets = rt_count;
     desc.SampleDesc.Count = target.samples;
     ComPtr<ID3D12PipelineState> pso;
-    const HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso));
+    const HRESULT hr = CreatePipelineGuarded(device, desc, pso.ReleaseAndGetAddressOf());
     if (FAILED(hr)) {
       if (logged_errors++ < 16) {
         REXLOG_WARN("tenchuz: N4 pipeline creation failed ({:08X}) vs {:016X} ps {:016X}", uint32_t(hr),
@@ -1047,7 +1109,8 @@ struct DrawPath::Impl {
     }
 
     // Guest viewport (untiled, from the device shadow) -> host NDC for a host
-    // viewport covering the whole render target.
+    // viewport covering the whole render target, in guest pixels (the target
+    // is resolution_scale times larger on the host).
     float vp[6];
     for (int i = 0; i < 6; ++i) {
       const uint32_t bits = REX_LOAD_U32(device_address + kDevVport + 4 * i);
@@ -1062,7 +1125,8 @@ struct DrawPath::Impl {
     const float ys = vte.vport_y_scale_ena ? vp[2] : 1.0f;
     const float yo = (vte.vport_y_offset_ena ? vp[3] : 0.0f) + half_pixel;
     const float zs = vte.vport_z_scale_ena ? vp[4] : 1.0f, zo = vte.vport_z_offset_ena ? vp[5] : 0.0f;
-    const float w = float(target.width), h = float(target.height);
+    const float w = float(target.width) / float(target.resolution_scale);
+    const float h = float(target.height) / float(target.resolution_scale);
     sc.ndc_scale[0] = xs * 2.0f / w;
     sc.ndc_offset[0] = xo * 2.0f / w - 1.0f;
     sc.ndc_scale[1] = -ys * 2.0f / h;
@@ -1136,10 +1200,11 @@ struct DrawPath::Impl {
 
   // Writes an SRV for one shader texture binding at `cpu`: a resolved render
   // target, else a loaded guest texture. False if neither fits the binding,
-  // with the reason.
+  // with the reason. Sets the fetch constant's bit in `resolution_scaled` (the
+  // textures_resolution_scaled system constant) for a resolution-scaled one.
   bool BindTexture(const gfx::DxbcShader::TextureBinding& binding, const gfx::RegisterFile& regs,
                    ID3D12GraphicsCommandList* list, DrawHost* textures, uint8_t* base,
-                   D3D12_CPU_DESCRIPTOR_HANDLE cpu, PlaceholderReason& reason) {
+                   D3D12_CPU_DESCRIPTOR_HANDLE cpu, PlaceholderReason& reason, uint32_t& resolution_scaled) {
     const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
     if (fetch.type != xenos::FetchConstantType::kTexture &&
         fetch.type != xenos::FetchConstantType::kInvalidTexture) {
@@ -1158,6 +1223,9 @@ struct DrawPath::Impl {
         view.Texture2DArray.MipLevels = 1;
         view.Texture2DArray.ArraySize = 1;
         device->CreateShaderResourceView(texture.resource, &view, cpu);
+        if (texture.resolution_scaled) {
+          resolution_scaled |= 1u << binding.fetch_constant;
+        }
         ++stats.textures_resolved;
         return true;
       }
@@ -1277,7 +1345,7 @@ struct DrawPath::Impl {
   // there are any, else placeholders of the binding's dimension.
   D3D12_GPU_DESCRIPTOR_HANDLE TextureTable(const gfx::DxbcShader& shader, const gfx::RegisterFile& regs,
                                            ID3D12GraphicsCommandList* list, DrawHost* textures,
-                                           uint8_t* base, bool& ok) {
+                                           uint8_t* base, bool& ok, uint32_t& resolution_scaled) {
     const auto& bindings = shader.GetTextureBindingsAfterTranslation();
     Frame& f = frames[slot];
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = {};
@@ -1302,7 +1370,7 @@ struct DrawPath::Impl {
         ++stats.signed_unused;
       } else {
         PlaceholderReason reason = kPlaceholderLoadFailed;
-        if (BindTexture(binding, regs, list, textures, base, cpu, reason)) {
+        if (BindTexture(binding, regs, list, textures, base, cpu, reason, resolution_scaled)) {
           cpu.ptr += view_inc;
           continue;
         }
@@ -1379,6 +1447,7 @@ void DrawPath::BeginFrame(uint32_t slot) {
     impl_->trace_vs = trace.empty() ? 0 : std::strtoull(trace.c_str(), nullptr, 16);
   }
   impl_->check_late_writes = REXCVAR_GET(tenchuz_native_check_late_writes);
+  impl_->log_offscreen = REXCVAR_GET(tenchuz_native_log_offscreen);
   {
     std::lock_guard lock(impl_->records_mutex);
     impl_->records[impl_->slot].clear();
@@ -1598,6 +1667,11 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   }
   Impl::DrawRecord record = {};
   record.vs = vs_shader.ucode_data_hash();
+  record.packet = draw.address;
+  record.color_info = target.color_info;
+  record.depth_info = target.depth_info;
+  record.color_surface = target.color_surface;
+  record.depth_surface = target.depth_surface;
   record.ps = shaders.pixel ? shaders.pixel->shader().ucode_data_hash() : 0;
   record.prim = uint32_t(prim);
   record.count = count;
@@ -1777,9 +1851,13 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   D3D12_GPU_VIRTUAL_ADDRESS fetch_gpu, vs_float_gpu, ps_float_gpu, system_gpu, bool_loop_gpu;
   auto* fetch = static_cast<uint8_t*>(m.AllocConstants(32 * 6 * 4, fetch_gpu));
   auto* bool_loop = static_cast<uint8_t*>(m.AllocConstants(40 * 4, bool_loop_gpu));
+  const uint8_t* vs_float_cpu = nullptr;  // the packed VS constants (draw list hash)
   auto pack_floats = [&](const gfx::Shader* shader, uint32_t first_reg, D3D12_GPU_VIRTUAL_ADDRESS& gpu) {
     const uint32_t n = shader ? shader->constant_register_map().float_count : 0;
     auto* out = static_cast<uint8_t*>(m.AllocConstants(16 * std::max(n, 1u), gpu));
+    if (shader == &vs_shader) {
+      vs_float_cpu = out;
+    }
     if (!out || !shader) return out != nullptr;
     const auto& map = shader->constant_register_map();
     for (uint32_t i = 0; i < 4; ++i) {
@@ -1807,12 +1885,49 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   m.FillTextureSigns(*system, regs, ps_shader);
 
   bool tables_ok = true;
-  const D3D12_GPU_DESCRIPTOR_HANDLE ps_table = ps_shader ? m.TextureTable(*ps_shader, regs, list, textures, base, tables_ok)
-                                                         : D3D12_GPU_DESCRIPTOR_HANDLE{};
-  const D3D12_GPU_DESCRIPTOR_HANDLE vs_table = m.TextureTable(vs_shader, regs, list, textures, base, tables_ok);
+  uint32_t resolution_scaled = 0;
+  const uint32_t guest_textures_before = m.stats.textures_guest;
+  const uint32_t resolved_textures_before = m.stats.textures_resolved;
+  const D3D12_GPU_DESCRIPTOR_HANDLE ps_table =
+      ps_shader ? m.TextureTable(*ps_shader, regs, list, textures, base, tables_ok, resolution_scaled)
+                : D3D12_GPU_DESCRIPTOR_HANDLE{};
+  const D3D12_GPU_DESCRIPTOR_HANDLE vs_table =
+      m.TextureTable(vs_shader, regs, list, textures, base, tables_ok, resolution_scaled);
   if (!tables_ok) {
     ++m.stats.skipped_other;
     return false;
+  }
+  system->textures_resolution_scaled = resolution_scaled;
+  record.target_width = target.width;
+  record.target_height = target.height;
+  record.samples = target.samples;
+  record.guest_textures = m.stats.textures_guest - guest_textures_before;
+  record.resolved_textures = m.stats.textures_resolved - resolved_textures_before;
+  record.depth_test = target.depth_format != DXGI_FORMAT_UNKNOWN && NormalizedDepthControl(regs).z_enable;
+  // Widescreen: 2D draws on the final target keep 16:9 proportions in the
+  // middle of the wider image: the HUD, menus and movies. Their vertices are
+  // already in screen pixels (a vertex shader without float constants), they
+  // have no depth test, and they sample only game textures. 3D draws (which
+  // need a matrix), full-screen passes over resolved images and untextured
+  // fades keep the whole width.
+  if (target.hud_scale_x != 1.0f && !record.depth_test && record.guest_textures && !record.resolved_textures &&
+      !vs_shader.constant_register_map().float_count) {
+    system->ndc_scale[0] *= target.hud_scale_x;
+    system->ndc_offset[0] *= target.hud_scale_x;
+    record.hud = true;
+    ++m.stats.hud_draws;
+  }
+  record.ndc_scale[0] = system->ndc_scale[0];
+  record.ndc_scale[1] = system->ndc_scale[1];
+  record.ndc_offset[0] = system->ndc_offset[0];
+  record.ndc_offset[1] = system->ndc_offset[1];
+  if (const uint32_t n = vs_shader.constant_register_map().float_count) {
+    // The packed VS constants were written just above (pack_floats).
+    record.vs_constants_hash = uint32_t(XXH3_64bits(vs_float_cpu, size_t(16) * n));
+  }
+  if (m.log_offscreen && !vs_shader.constant_register_map().float_count && record.vb_size &&
+      record.vb_stride >= 8) {
+    m.LogOffscreen(base, record);
   }
 
   // Record.

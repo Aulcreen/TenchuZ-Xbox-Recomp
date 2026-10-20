@@ -13,6 +13,7 @@ Source files copied unmodified from the ReXGlue SDK
 | `ucode.cpp` | `src/graphics/format/ucode.cpp` |
 | `geometry_shader.cpp` | `PipelineCache::CreateDxbcGeometryShader` from `src/graphics/d3d12/pipeline_cache.cpp` (body unchanged, as a free function) |
 | `shaders/texture_load_*_cs.h` | `src/graphics/shaders/bytecode/d3d12_5_1/` (the unscaled loaders the D3D12 backend uses) |
+| `shaders/fxaa_cs.h`, `shaders/fxaa_extreme_cs.h` | `src/graphics/shaders/bytecode/d3d12_5_1/` (the swap's FXAA pass, `swap_post_effect`) |
 | `texture/util.cpp`, `texture/info.cpp`, `texture/info_formats.cpp`, `texture/extent.cpp` | `src/graphics/pipeline/texture/` |
 | `thirdparty/dxbc/DXBCChecksum.*` | `thirdparty/dxbc/` |
 

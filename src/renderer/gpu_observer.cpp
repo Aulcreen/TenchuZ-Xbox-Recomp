@@ -37,6 +37,11 @@ constexpr uint32_t kMaxSyncGap = 16u << 10;     // larger jumps mean a segment s
 constexpr uint32_t kStuckGap = 4u << 10;
 constexpr uint32_t kSegmentReserve = 0xA0;    // device +0x2C (segment end) - +0x30 (limit)
 constexpr uint32_t kSegmentScan = 16u << 10;  // slack below the lowest write pointer seen (InCommandRing)
+// Device: the D3D command ring's first byte and last dword. The D3D places
+// dynamic vertices (BeginVertices) at the ring's top, above its last segment,
+// where the write pointer never goes.
+constexpr uint32_t kRingStartOffset = 0x34C8;
+constexpr uint32_t kRingLastOffset = 0x34CC;
 constexpr uint32_t kKickHeaderMax = 64;       // bytes the D3D leaves after a kick before the next packets
 // The D3D's kick family: the kick (submits the segment, may switch to a new
 // one), the end-of-frame kick, and the helpers they call, which leave header
@@ -50,7 +55,6 @@ bool IsKickFunction(uint32_t function) {
       return false;
   }
 }
-constexpr uint32_t kKickScan = 512;           // bytes of a new segment searched for its first packet
 constexpr uint32_t kMagic = 0x424F5A54;         // "TZOB"
 
 enum class State { kOff, kWarmup, kRecord };
@@ -99,8 +103,14 @@ ResyncStats g_resync_stats;
 uint32_t g_frame_stuck_address = 0;  // first stuck point this frame (diagnostics)
 uint32_t g_kick_depth = 0;           // hook depth of a kick in progress, 0 if none
 std::atomic<uint32_t> g_ring_low{0xFFFFFFFFu}, g_ring_high{0};  // physical range written so far
+std::atomic<uint32_t> g_ring_start{0}, g_ring_last{0};  // the device's ring bounds, physical (0: not seen)
+std::atomic<bool> g_sync_trace{false};  // SetSyncTrace
 
 void OnDraw(const pm4::DrawInfo& info) {
+  if (g_sync_trace.load(std::memory_order_relaxed)) {
+    REXLOG_INFO("tenchuz: observe draw packet {:08X} opcode {:02X} in {:08X}", info.address, info.opcode,
+                g_depth ? g_top_function : 0);
+  }
   if (g_live_callback && g_live_requested.load(std::memory_order_relaxed)) {
     g_live_callback(info, *g_decoder, g_base, g_depth ? g_top_function : 0);
   }
@@ -246,6 +256,13 @@ void Sync(uint8_t* base, uint32_t function, char where) {
     if (physical > g_ring_high.load(std::memory_order_relaxed)) {
       g_ring_high.store(physical, std::memory_order_relaxed);
     }
+    // The ring's own bounds, when they hold the write pointer.
+    const uint32_t start = REX_LOAD_U32(g_device + kRingStartOffset) & 0x1FFFFFFFu;
+    const uint32_t last = REX_LOAD_U32(g_device + kRingLastOffset) & 0x1FFFFFFFu;
+    if (start < last && last - start < (64u << 20) && physical >= start && physical <= last + 4) {
+      g_ring_start.store(start, std::memory_order_relaxed);
+      g_ring_last.store(last, std::memory_order_relaxed);
+    }
   }
   const uint64_t packets = g_decoder->packets, zeros = g_decoder->zero_headers;
   // A new ring segment (limit changed) or a jump larger than one call writes
@@ -255,11 +272,14 @@ void Sync(uint8_t* base, uint32_t function, char where) {
   if (g_live_requested.load(std::memory_order_relaxed) && g_cursor &&
       (limit != g_limit || next < g_cursor)) {
     // The D3D switched command buffer segments. The switch (sub_8242A8B8) is
-    // hooked, so this sync is right after it: finish the old segment up to its
-    // fence and trailer, then continue at the new segment's write pointer,
-    // past its header (scanning back for packets would find stale ones).
+    // hooked, so the old segment was decoded up to its last write at the
+    // switch's entry, and this sync is right after it: continue at the new
+    // segment's write pointer, past its header (scanning back for packets
+    // would find stale ones). The old segment's tail is not decoded: the D3D
+    // switches when the next write doesn't fit, so past its last write it
+    // holds the kick's trailer and then stale packets from the ring's previous
+    // lap, which would replay old draws and state.
     ++g_resync_stats.segment;
-    DecodePlausible(base, g_cursor, g_limit + kSegmentReserve);
     g_limit = limit;
     g_cursor = next;
   } else {
@@ -327,7 +347,10 @@ void Sync(uint8_t* base, uint32_t function, char where) {
     SeedFromDevice(base);
   }
   const int32_t debug = REXCVAR_GET(tenchuz_gpu_observe_debug);
-  if (debug > 0 && g_debug_lines < debug) {
+  if (g_sync_trace.load(std::memory_order_relaxed) && (before != g_cursor || resync)) {
+    REXLOG_INFO("tenchuz: observe sync {} {:08X} cursor {:08X} -> {:08X} next {:08X}{} limit {:08X}", where, function,
+                before, g_cursor, next, resync ? " RESYNC" : "", limit);
+  } else if (debug > 0 && g_debug_lines < debug) {
     ++g_debug_lines;
     REXLOG_INFO("tenchuz: observe {} {:08X} cursor {:08X} -> {:08X} next {:08X}{} packets +{} zeros +{} limit {:08X}",
                 where, function, before, g_cursor, next, resync ? " RESYNC" : "",
@@ -337,30 +360,27 @@ void Sync(uint8_t* base, uint32_t function, char where) {
 }
 
 // End of a kick (sub_82426DF0): the D3D finished a command segment with a
-// fence, possibly moved to a new segment, left a few header dwords the GPU
-// never executes, and may have re-emitted some state after them. Decode the
-// fence, then resume at the first packet after the header: within what the
-// kick itself wrote (fresh), or the last few hundred bytes of a new segment.
+// fence, possibly moved to a new segment, and left header dwords the GPU never
+// executes. Everything written before the kick was decoded at its entry; what
+// the kick itself wrote is skipped. It holds no draws, and its state isn't the
+// GPU's: the D3D re-emits only what it believes changed, and at some kicks
+// (around the ring's wrap) the header parses as a register write
+// (PA_CL_VTE_CNTL = 0x300, screen-space) that the D3D then never undoes, so the
+// following 3D draws lost their viewport transform. Scanning back for
+// "re-emitted" packets also found stale ones from the ring's previous lap.
 void EndKick(uint8_t* base) {
   g_base = base;
   const uint32_t next = REX_LOAD_U32(g_device + kWritePointerOffset) + 4;
   const uint32_t limit = REX_LOAD_U32(g_device + kLimitOffset);
   ++g_resync_stats.kicks;
-  uint32_t from;
   if (limit != g_limit || next < g_cursor) {
     ++g_resync_stats.segment;
-    DecodePlausible(base, g_cursor, g_limit + kSegmentReserve);
-    g_limit = limit;
-    from = next > kKickScan ? next - kKickScan : 0;
-  } else {
-    g_cursor = DecodePlausible(base, g_cursor, next);
-    if (g_cursor >= next) {
-      return;
-    }
-    from = g_cursor + 4;
   }
-  const uint32_t resume = EarliestPacketStart(base, from, next);
-  g_cursor = resume ? g_decoder->Decode(base, resume, next) : next;
+  if (g_sync_trace.load(std::memory_order_relaxed)) {
+    REXLOG_INFO("tenchuz: observe kick end cursor {:08X} -> next {:08X} limit {:08X}", g_cursor, next, limit);
+  }
+  g_limit = limit;
+  g_cursor = next;
 }
 
 bool OnRenderThread() {
@@ -538,10 +558,22 @@ void SetLiveDecoding(bool enable, LiveDrawCallback callback) {
   g_live_requested.store(enable);
 }
 
+void SetSyncTrace(bool on) {
+  g_sync_trace.store(on, std::memory_order_relaxed);
+}
+
 bool InCommandRing(uint32_t address) {
   address &= 0x1FFFFFFFu;
-  // Segments are filled from their start, so the lowest write pointer seen is
-  // a little past the ring's start: allow one segment-scan window below it.
+  // The device's ring bounds (seen holding the write pointer): the D3D keeps
+  // dynamic vertices at the ring's top, above its last segment.
+  const uint32_t start = g_ring_start.load(std::memory_order_relaxed);
+  const uint32_t last = g_ring_last.load(std::memory_order_relaxed);
+  if (start < last) {
+    return address >= start && address <= last;
+  }
+  // Else the range written so far. Segments are filled from their start, so
+  // the lowest write pointer seen is a little past the ring's start: allow one
+  // segment-scan window below it.
   const uint32_t low = g_ring_low.load(std::memory_order_relaxed);
   const uint32_t high = g_ring_high.load(std::memory_order_relaxed);
   return low <= high && address + kSegmentScan >= low && address <= high + kSegmentReserve;

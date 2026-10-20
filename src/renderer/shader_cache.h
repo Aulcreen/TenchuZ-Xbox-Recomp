@@ -34,7 +34,10 @@ struct ShaderStats {
 
 class ShaderCache {
  public:
-  explicit ShaderCache(rex::ui::GraphicsProvider::GpuVendorID vendor);
+  // `resolution_scale`: host pixels per guest pixel of the render targets, on
+  // each axis (the translator reverts it for pixel positions and scales it in
+  // for unnormalized fetches from resolution-scaled textures).
+  ShaderCache(rex::ui::GraphicsProvider::GpuVendorID vendor, uint32_t resolution_scale);
   ~ShaderCache();
 
   // Shaders for the draw just decoded. Returns false if the vertex shader is

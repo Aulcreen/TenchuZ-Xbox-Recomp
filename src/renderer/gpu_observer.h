@@ -61,6 +61,10 @@ ResyncStats TakeResyncStats();
 // Whether guest physical `address` is in the range the D3D's command buffer
 // write pointer has covered (its ring of segments).
 bool InCommandRing(uint32_t address);
+
+// While on, log every sync that decodes or resyncs, every kick end and every
+// decoded draw packet (diagnostics: --tenchuz_native_trace_syncs_at).
+void SetSyncTrace(bool on);
 void SetOutputDir(const std::filesystem::path& dir);
 
 }  // namespace tenchuz::gpu_observer

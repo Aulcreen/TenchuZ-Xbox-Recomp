@@ -14,7 +14,9 @@
 #include "frame_stats.h"
 #include "renderer/d3d_trace.h"
 #include "renderer/gpu_observer.h"
+#include "renderer/native_gpu.h"
 #include "renderer/native_renderer.h"
+#include "widescreen.h"
 
 class TenchuzApp : public rex::ReXApp {
  public:
@@ -27,9 +29,13 @@ class TenchuzApp : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    // Xenos GPU emulation (staged next to the exe by GPU_PLUGINS in CMakeLists).
-    // --gpu_plugin on the command line still takes precedence.
-    if (config.gpu_plugin.empty()) {
+    // No GPU emulation by default (renderer/native_gpu.h). With
+    // --tenchuz_native_gpu=false, Xenos GPU emulation (staged next to the exe
+    // by GPU_PLUGINS in CMakeLists); --gpu_plugin still takes precedence there.
+    if (tenchuz::native::NativeGpu()) {
+      config.graphics = tenchuz::native::CreateNativeGraphicsSystem();
+      config.gpu_plugin.clear();
+    } else if (config.gpu_plugin.empty()) {
       config.gpu_plugin = "xenos";
     }
     tenchuz::native::EnableDeviceDiagnostics();
@@ -71,15 +77,21 @@ class TenchuzApp : public rex::ReXApp {
     // Without this the screen stays black when a mission starts (Xenia needed
     // the same flag). It's defined by the GPU plugin, so it only exists here,
     // after the plugin has loaded.
-    rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
-    REXLOG_INFO("tenchuz: gpu_allow_invalid_fetch_constants = {}",
-                rex::cvar::GetFlagByName("gpu_allow_invalid_fetch_constants"));
+    if (!tenchuz::native::NativeGpu()) {
+      rex::cvar::SetFlagByName("gpu_allow_invalid_fetch_constants", "true");
+      REXLOG_INFO("tenchuz: gpu_allow_invalid_fetch_constants = {}",
+                  rex::cvar::GetFlagByName("gpu_allow_invalid_fetch_constants"));
+    }
+  }
+
+  void OnPostLoadXexImage() override {
+    // The game's aspect ratio constant, before any game code runs.
+    tenchuz::widescreen::PatchGame(runtime()->virtual_membase());
   }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}
   // void OnLoadXexImage(std::string& xex_image) override {}
-  // void OnPostLoadXexImage() override {}
   // void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {}
   // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>

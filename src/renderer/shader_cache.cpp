@@ -43,8 +43,10 @@ bool AnalyzeGuarded(gfx::Shader& shader, rex::string::StringBuffer& disasm_buffe
 }
 
 struct ShaderCache::Impl {
-  explicit Impl(rex::ui::GraphicsProvider::GpuVendorID vendor)
-      : translator(vendor, /*bindless_resources_used=*/false, /*edram_rov_used=*/false) {}
+  Impl(rex::ui::GraphicsProvider::GpuVendorID vendor, uint32_t resolution_scale)
+      : translator(vendor, /*bindless_resources_used=*/false, /*edram_rov_used=*/false,
+                   /*gamma_render_target_as_unorm8=*/false, /*msaa_2x_supported=*/true, resolution_scale,
+                   resolution_scale) {}
 
   gfx::DxbcShaderTranslator translator;
   rex::string::StringBuffer disasm_buffer;
@@ -111,8 +113,8 @@ struct ShaderCache::Impl {
   }
 };
 
-ShaderCache::ShaderCache(rex::ui::GraphicsProvider::GpuVendorID vendor)
-    : impl_(std::make_unique<Impl>(vendor)) {}
+ShaderCache::ShaderCache(rex::ui::GraphicsProvider::GpuVendorID vendor, uint32_t resolution_scale)
+    : impl_(std::make_unique<Impl>(vendor, resolution_scale)) {}
 
 ShaderCache::~ShaderCache() = default;
 

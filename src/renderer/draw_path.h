@@ -34,8 +34,17 @@ struct DrawTarget {
   uint32_t color_mask = 0;  // DrawPath::WrittenColorMask, 4 bits per target
   DXGI_FORMAT depth_format = DXGI_FORMAT_UNKNOWN;  // UNKNOWN = no depth buffer
   D3D12_CPU_DESCRIPTOR_HANDLE dsv = {};
-  uint32_t width = 0, height = 0;
+  uint32_t width = 0, height = 0;  // host pixels
   uint32_t samples = 1;  // MSAA sample count of every bound target
+  uint32_t resolution_scale = 1;  // host pixels per guest pixel, on each axis
+  // On the target the front buffer is resolved from, with a wider aspect ratio
+  // (widescreen.h): 16/9 over that ratio. Its 2D draws (no depth test, game
+  // textures only: the HUD, menus, movies) are scaled by this horizontally
+  // around the centre, so they keep 16:9 proportions. 1 elsewhere.
+  float hud_scale_x = 1.0f;
+  // Diagnostics for the draw list: RB_COLOR_INFO / RB_DEPTH_INFO from the
+  // device and the native surfaces' creation numbers.
+  uint32_t color_info = 0, depth_info = 0, color_surface = 0, depth_surface = 0;
 };
 
 // What the draw path needs from the renderer that owns the frame.
@@ -47,6 +56,9 @@ class DrawHost {
     // Guest component (X, Y, Z, W) -> host component, 3 bits each, as in the
     // SDK's texture cache (GuestToHostSwizzle).
     uint32_t host_format_swizzle = 0;
+    // Rendered at the resolution scale (DrawTarget::resolution_scale), so the
+    // shader scales its unnormalized coordinates and size queries.
+    bool resolution_scaled = false;
   };
   // The texture for a 2D fetch of guest physical `address`, width x height,
   // with any state transition needed for sampling recorded on `list`.
@@ -85,6 +97,7 @@ struct DrawStats {
   uint32_t skipped_culled = 0;     // both faces culled
   uint32_t mrt_draws = 0;          // draws writing more than one colour target
   uint32_t stencil_draws = 0;      // draws with the stencil test on
+  uint32_t hud_draws = 0;          // 2D draws kept at 16:9 (DrawTarget::hud_scale_x)
   uint32_t skipped_other = 0;
   uint32_t uploaded_kb = 0;
   uint32_t arena_kb = 0;          // dynamic vertices and indices copied per draw

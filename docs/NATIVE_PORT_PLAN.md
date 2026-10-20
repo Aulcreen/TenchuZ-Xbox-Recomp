@@ -285,8 +285,177 @@ with a few fixed-step candidates to test at 60 fps.
   Exit: menus and the dojo match the Xenos path.
 - **N5 Parity + remove the ring.** All missions match. Complete fences on the native GPU timeline,
   turn the ring kick into a no-op, and disable the GPU plugin. **The GPU emulation is gone.**
+  ✅ *Done (2026-10-20); the default since 2026-10-20*. `--tenchuz_native_gpu=false` runs the
+  emulator instead (with F10 between its output and native output).
+  - `src/renderer/native_gpu.cpp` replaces the Xenos plugin as the runtime's graphics system
+    (`RuntimeConfig::graphics`, so `rexgpu-xenos` isn't loaded). It provides:
+    - the D3D12 device and presenter the native renderer draws through;
+    - the GPU's MMIO registers;
+    - vblank interrupts at the video mode's refresh rate;
+    - a command processor for the ring.
+  - The command processor executes only what the game can observe:
+    - register writes, memory writes, fences (`EVENT_WRITE_SHD`) and waits;
+    - interrupts, the swap counter, the ring read pointer and its write-back.
+  - Draws, resolves and swaps in the ring are skipped, because the native renderer records them
+    from the D3D calls. Occlusion queries report a fixed 1000 samples (`EVENT_WRITE_ZPD`) or
+    "visible" (`VIZ_QUERY`). An opcode it doesn't execute is logged once.
+  - Fences complete when the command processor reaches them, not on the native GPU timeline.
+    That's safe because the native renderer copies the guest data it draws with while recording,
+    and waits for the previous frame before recording the next.
+  - In native GPU mode, native output is forced on and F10 can't switch back. The swap packet is
+    left alone, since nothing emulates it.
+  - Verified: the title, menus, character creation, the Ninja Village and Mission 1 render
+    correctly.
+    - The Mission 1 frame matches the emulator reference: mean colour 39.6/39.5/39.2 against
+      39.5/39.5/39.1, and edge strength 2.00 against 2.04.
+    - A 4-minute mission soak held 30 fps, with no errors or unexecuted opcodes, and flat
+      non-local GPU memory (645 MB). The never-closed emulator frame and its 3.6 MB/s leak are
+      gone.
+  - Cost in the Ninja Village, emulator plus native output against native GPU:
+    - private memory: 3.5 GB against 1.25-1.3 GB;
+    - GPU 3D engine: 35% against 21% busy;
+    - CPU: 1.27-1.30 against 1.14-1.25 cores.
+  - Other missions (2026-10-20), before making native the default. A test copy of the save has
+    every mission marked completed; the real save is untouched (`--user_data_root` on a copy).
+    - Save layout (`tenchu.bin`, 5216 bytes, big-endian, no checksum):
+      - load and save go through the 5216-byte buffers at `0x82B01D40` (file I/O) and
+        `0x82B008D0` (live);
+      - the missions are 8 chapter sections of 488 bytes from offset `0x500`: section number,
+        count, then 48-byte entries;
+      - an entry is id, flags, `0x14`, then three per-difficulty 12-byte records. Each record's
+        first word has bit 0 "cleared" (`0x822B76A0`) and bit 1 "completed", the bit the unlock
+        rule (`0x822B79D0`) checks on a mission's prerequisite in the same chapter;
+      - the 44 12-byte records at `0x1E0` are inventory (count, obtained), not missions.
+    - Missions 4 ("Gather Information"), 12, 25, 38 ("Wipe Out the Enemy", kill-counter HUD)
+      and 47 ("Hammer of Judgment", in-engine cutscene with subtitles) render correctly
+      natively: intro text scenes, cutscenes, gameplay and the pause menu, at 30 fps, with no
+      errors and no frame jumps in the per-present check.
+  - Not covered:
+    - real occlusion query results;
+    - CPU reads of resolved images from guest memory: native resolves stay in native textures.
+  - For A/B against the emulator, run with `--tenchuz_native_gpu=false --tenchuz_native_output=true`
+    and take the emulator shot first.
+  - Fixed (2026-10-20): **flicker and glitches** in the menus, loading screens, missions and the
+    pause menu. All four came from the live command-stream decoding:
+    - **Black frames in menus and loading screens**, about every 0.75 s. The D3D keeps dynamic
+      vertices (BeginVertices) at the top of its 4 MB command ring, above its last segment, where
+      the write pointer never goes. `InCommandRing` only knew the range the write pointer had
+      covered, so those draws took the once-per-frame static upload and read stale vertices.
+      The ring's bounds now come from the device (`+0x34C8` start, `+0x34CC` last dword).
+    - **Stray geometry in missions** (stretched triangles and lines, one frame at a time).
+      - At a segment switch the observer finished the old segment up to its limit plus the
+        trailer reserve. But the D3D switches when the next write doesn't fit, so past its last
+        write the old segment holds stale packets from the ring's previous lap.
+      - Those stale draws were replayed with the current state: an index buffer drawn with
+        another mesh's vertices. The old segment's tail is no longer decoded; everything before
+        a switch has been decoded at the hooked call that made it.
+    - **Pause menu: the scene behind it rendered wrong every 22 frames** (each ring lap).
+      - At a kick's end the observer decoded what the kick itself wrote. Near the ring's wrap,
+        a kick header parses as a register write: `PA_CL_VTE_CNTL = 0x300`, screen space.
+      - The D3D never undoes that write, since it isn't GPU state in its model. So the
+        following 3D draws lost their viewport transform and wrote depth everywhere.
+      - Nothing a kick writes is decoded any more, and the 512-byte back-scan after kicks is
+        gone. That scan had also replayed stale packets.
+    - **A crash in pipeline creation**: the driver's DXBC conversion read a null pointer on a
+      shader from a mis-decoded load. Pipeline creation now runs under an exception guard and
+      fails that pipeline instead.
+    - Verified with a per-present brightness check (`--tenchuz_native_check_presents`), from
+      the title through Mission 1 and its pause menu, at 16:9 and 21:9: no frame jumps left
+      except the intro logo's own animation and the mission-select confirm flash. Holds 30 fps.
+      The black frame entering the village was a kick artifact too.
+    - Diagnostics added, all off by default:
+      - `--tenchuz_native_check_presents`: the brightness of each presented frame and of the
+        presenter's output, in four bands;
+      - `--tenchuz_native_log_presents`: per frame, the front buffer, its last resolve, and
+        the frame's draw, resolve and clear counts;
+      - `--tenchuz_native_log_offscreen`: screen-space draws whose vertices reach far off
+        screen;
+      - `--tenchuz_native_trace_syncs_at` / `_frames`: the observer's syncs, kick ends and draw
+        packets for a window of frames;
+      - more draw-list fields (`--tenchuz_native_log_draws`): NDC mapping, a hash of the VS
+        constants, packet address, and the bound colour and depth surfaces.
 - **N6 PC rendering features.** Internal resolution scaling, MSAA/SMAA, widescreen/ultrawide FOV,
   and HUD scaling.
+  - **N6.1 Internal resolution scaling.** ✅ *Done (2026-10-20)*.
+    `--tenchuz_native_resolution_scale=N` (1-4, read at startup) renders natively at N times the
+    game's resolution on each axis, like the SDK's draw resolution scale:
+    - Render targets, depth buffers and resolve destinations are N times larger. They keep their
+      guest size for lookups, so texture fetches still find resolves by address and size.
+    - Draws map the guest viewport onto the larger target.
+    - The translator is built with the scale. It divides pixel positions by it, and for fetches
+      from resolved (scaled) textures it multiplies unnormalized coordinates, sizes and offsets
+      by it (the `textures_resolution_scaled` system constant).
+    - The slope-scaled depth bias is multiplied by N, like the SDK's ROV path, so the bias per
+      guest pixel stays the same.
+    - The front buffer goes to the presenter at full size, and the presenter fits it to the
+      window.
+  - Verified in Mission 1 without GPU emulation, in a 1920×1080 window:
+    - 2x: the resolves are 2560×1440, with 578 of 578 draws issued. Mean colour matches 1x
+      (39.7 against 39.5). The window image is sharper (edge strength 3.39 against 1.99), and
+      the HUD and 3D scene gain detail without moving.
+    - Cost on this PC (8 GB GPU): 1x holds 30 fps with the GPU 22% busy. 2x holds 30 fps at
+      35%. 4x (5120×2880) drops to about 25 fps at 82%.
+    - The title menu and pause screen also draw correctly at 4x.
+  - **N6.2 Anti-aliasing.** ✅ *Done (2026-10-20)*. Two options, both off by default:
+    - `--tenchuz_native_msaa_samples=4` renders the game's multisampled targets (its 2x 3D
+      passes) with 4x MSAA. The pipelines, alpha to coverage and the sample-count system
+      constants follow the host count. A resolve that averages every guest sample (the game's
+      `k01`) averages all four.
+    - `--tenchuz_native_post_effect=fxaa` (or `fxaa_extreme`) runs FXAA on the presented image,
+      like the emulator's `swap_post_effect`, which lives in the GPU plugin and is gone without
+      it:
+      - The present blit writes the image with its luma in alpha, like the SDK's
+        `apply_gamma_table_fxaa_luma`, to a 16-bit intermediate.
+      - The SDK's FXAA shaders (vendored bytecode) filter that into the presenter's output.
+      - It runs at the output's size, so after resolution scaling.
+    - Verified in Mission 1 at 1x: both hold 30 fps (GPU 23% busy, against 22%) with no errors.
+      - 4x MSAA: resolves read four samples. Mean colour matches (33.5 against 33.6), and
+        geometry edges gain intermediate shades, though the change is subtle: the game's
+        full-screen passes already soften its image, and resolution scaling does far more.
+      - FXAA: same mean colour, with visibly smoother edges. It also softens some texture
+        detail (edge strength 1.88 against 1.99).
+    - SMAA isn't done: it needs its precomputed area and search textures, which aren't in the
+      SDK.
+  - **N6.3 Wider aspect ratios (Hor+) and the HUD.** *In progress (2026-10-20)*.
+    `--tenchuz_aspect_ratio=21:9` (W:H or a number, 4:3 to 48:9; default 16:9, which changes
+    nothing). Code is in `src/widescreen.cpp`.
+    - The game's aspect ratio is one read-only constant, 16/9 at `0x8200B73C`.
+      - The startup display setup `sub_822A6AE8` copies it to `0x829BF1B4`, which overwrites the
+        4:3 default there.
+      - Camera init `sub_823E0F90` reads it through `sub_822A6C30` into the camera block at
+        `0x8340BD40`: far `+0`, aspect `+8`, FOV `+C`, `+30`.
+      - `sub_823E1128` builds the projection with a vertical FOV: y scale cot(fov/2), x scale
+        that over the aspect.
+      - Four rendering functions also load the constant directly (`0x8237BCE8`, `0x82387264`,
+        `0x82388B0C`, `0x82389190`), as does the movie player (`0x82560E54`).
+    - `OnPostLoadXexImage` overwrites the constant before any game code runs. The game renders
+      Hor+: at 21:9, the Mission 1 frame is the 16:9 frame scaled to the same height with more
+      scene on both sides (mean difference 0.58, against 9.11 for a stretch). No pop-in shows at
+      the edges.
+    - The render targets stay 1280×720, so the image is anamorphic, and the presenter shows it
+      at the chosen aspect. At 1x that stretches 1280 columns over the wider screen, so pair it
+      with `--tenchuz_native_resolution_scale=2`.
+    - HUD (`--tenchuz_widescreen_hud`, on by default): draws on the render target the front
+      buffer is resolved from are scaled horizontally to a centred 16:9 area. They must have no
+      depth test, sample only game textures, and use a vertex shader without float constants,
+      i.e. vertices already in screen pixels.
+      - In the logs that's the sprite shader (`64B04B39`: HUD, menus), the menu text quad lists
+        (`B393A267`) and the movie (`118071C8`, three textures). Movies keep 16:9.
+      - Full-screen passes over resolved images, untextured fades and 3D draws keep the full
+        width.
+      - In Mission 1 and its pause menu, the HUD and menu keep their proportions, and the pause
+        dimming covers the whole screen. The frame log counts "kept at 16:9" draws, and the
+        draw list (`--tenchuz_native_log_draws`) shows each draw's target, depth test and
+        texture kinds.
+    - The one-frame artifact first seen at 21:9 (a white line from a lantern, a wood-textured
+      wedge) wasn't widescreen's: it was the stale-draw replay fixed under N5 (2026-10-20), and
+      it happened at 16:9 too. Mission 1 at 21:9 is now clean in the per-present check.
+    - Open:
+      - Particles are drawn by the same quad-list shader as the menu text, but in the 3D scene
+        with a depth test, so they aren't squeezed. CPU-projected markers drawn on the final
+        target without depth would be.
+      - The ultrawide image is anamorphic. Rendering targets wider than the game's 1280 needs
+        the game's 2D and post passes to cope, and is not done.
 
 ### Track A: native audio (low priority: audio already works)
 - **A1** Map XACT/XAudio usage: which voices take XMA from the `.xwb` banks.

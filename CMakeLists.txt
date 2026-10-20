@@ -16,10 +16,12 @@ set(TENCHUZ_SOURCES
     src/crash_report.cpp
     src/frame_stats.cpp
     src/profile_fix.cpp
+    src/widescreen.cpp
     src/renderer/d3d_trace.cpp
     src/renderer/d3d_trace_hooks.gen.cpp
     src/renderer/draw_path.cpp
     src/renderer/gpu_observer.cpp
+    src/renderer/native_gpu.cpp
     src/renderer/native_renderer.cpp
     src/renderer/pm4_decoder.cpp
     src/renderer/shader_cache.cpp

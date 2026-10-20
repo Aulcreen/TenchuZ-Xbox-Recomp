@@ -39,8 +39,10 @@
 
 #include "draw_path.h"
 #include "hook_common.h"
+#include "native_gpu.h"
 #include "shader_cache.h"
 #include "texture_loader.h"
+#include "../widescreen.h"
 
 REXCVAR_DEFINE_BOOL(tenchuz_native_output, false, "tenchuz",
                     "Start with native renderer output instead of the emulator's (F10 toggles)");
@@ -60,6 +62,23 @@ REXCVAR_DEFINE_INT32(tenchuz_native_log_every, 0, "tenchuz",
                      "Log one native frame every N frames (0 = off)");
 REXCVAR_DEFINE_BOOL(tenchuz_native_msaa, true, "tenchuz",
                     "Native render targets use the guest's MSAA sample count (RB_SURFACE_INFO)");
+REXCVAR_DEFINE_INT32(tenchuz_native_resolution_scale, 1, "tenchuz",
+                     "Internal resolution of native rendering, in multiples of the game's (1-4, at startup)");
+REXCVAR_DEFINE_BOOL(tenchuz_native_log_presents, false, "tenchuz",
+                    "Log every native frame end: the front buffer, when it was last resolved, and the frame's "
+                    "draws, resolves and clears");
+REXCVAR_DEFINE_INT32(tenchuz_native_trace_syncs_at, 0, "tenchuz",
+                     "First native frame whose command-stream syncs, kick ends and draw packets are logged");
+REXCVAR_DEFINE_INT32(tenchuz_native_trace_syncs_frames, 1, "tenchuz",
+                     "Number of frames traced from tenchuz_native_trace_syncs_at");
+REXCVAR_DEFINE_BOOL(tenchuz_native_check_presents, false, "tenchuz",
+                    "Log the brightness of every presented native frame and of the presenter's output "
+                    "(flicker hunting)");
+REXCVAR_DEFINE_INT32(tenchuz_native_msaa_samples, 0, "tenchuz",
+                     "MSAA samples of the game's multisampled render targets: 0 = the game's (2x), 4 = 4x");
+REXCVAR_DEFINE_STRING(tenchuz_native_post_effect, "none", "tenchuz",
+                      "Native output post effect: none, fxaa, fxaa_extreme (the emulator's swap_post_effect)")
+    .allowed({"none", "fxaa", "fxaa_extreme"});
 REXCVAR_DEFINE_BOOL(tenchuz_dred, false, "tenchuz",
                     "Enable D3D12 DRED (auto-breadcrumbs, page faults) for GPU hang reports, without the debug layer");
 
@@ -67,6 +86,12 @@ using Microsoft::WRL::ComPtr;
 
 namespace tenchuz::native {
 namespace {
+
+// The SDK's FXAA pass (its swap_post_effect), vendored in external/xenos_shader.
+namespace shaders {
+#include "fxaa_cs.h"
+#include "fxaa_extreme_cs.h"
+}  // namespace shaders
 
 constexpr uint32_t kFramesInFlight = 2;
 constexpr uint32_t kPm4XeSwap = 0x64;  // SDK-specific swap packet written by VdSwap
@@ -96,11 +121,15 @@ rex::ui::Presenter* g_presenter = nullptr;
 const rex::ui::d3d12::D3D12Provider* g_provider = nullptr;
 ID3D12Device* g_d3d = nullptr;
 bool g_ready = false;
+// Host pixels per guest pixel on each axis of render targets and resolves
+// (--tenchuz_native_resolution_scale).
+uint32_t g_scale = 1;
 uint64_t g_frame = 0;
 int32_t g_log_frames = 0;
 std::unique_ptr<ShaderCache> g_shaders;
 std::unique_ptr<DrawPath> g_draw_path;
 uint32_t g_frame_draws = 0, g_frame_draws_ready = 0;
+uint32_t g_frame_resolves = 0, g_frame_clears = 0;  // --tenchuz_native_log_presents
 std::map<uint64_t, uint32_t> g_draw_kinds;  // (API function, opcode, predicated) -> draws, logged frames
 
 // --- D3D12 plumbing ---------------------------------------------------------
@@ -133,6 +162,17 @@ ComPtr<ID3D12PipelineState> g_resolve_pso;  // resolve with format conversion (s
 ComPtr<ID3D12PipelineState> g_resolve_msaa_pso;        // ... from a multisampled colour target
 ComPtr<ID3D12PipelineState> g_resolve_depth_msaa_pso;  // one sample of a multisampled depth buffer
 bool g_msaa_2x = false, g_msaa_4x = false;  // host support for every target format
+// FXAA on the presented image (--tenchuz_native_post_effect), like the SDK's
+// swap: the blit writes the image with its luma in alpha to g_fxaa_source,
+// and the SDK's FXAA shader filters that into the presenter's output.
+ComPtr<ID3D12RootSignature> g_fxaa_root;
+ComPtr<ID3D12PipelineState> g_fxaa_pso, g_fxaa_extreme_pso;
+ComPtr<ID3D12Resource> g_fxaa_source;
+D3D12_RESOURCE_STATES g_fxaa_source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+constexpr DXGI_FORMAT kFxaaSourceFormat = DXGI_FORMAT_R16G16B16A16_UNORM;  // the SDK's
+// Per frame slot: blit source SRV, blit destination UAV, FXAA source SRV and
+// FXAA destination UAV; then the resolves'.
+constexpr uint32_t kPresentDescriptors = 4;
 constexpr uint32_t kResolveDescriptors = 512;  // per frame slot, 2 per converting resolve
 std::array<uint32_t, kFramesInFlight> g_resolve_descriptors_used{};
 
@@ -141,13 +181,19 @@ std::array<uint32_t, kFramesInFlight> g_resolve_descriptors_used{};
 struct Surface {
   ComPtr<ID3D12Resource> resource;
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-  uint32_t width = 0, height = 0;
+  uint32_t width = 0, height = 0;  // guest pixels
+  uint32_t scale = 1;              // the resource is width x height times this
   bool depth = false;
   bool red_blue_swapped = false;  // resolved with RB_COPY_DEST_INFO.copy_dest_swap
   bool unordered_access = false;  // created for converting resolves
+  uint64_t resolved_frame = 0;    // native frame of the last resolve into it
+  uint32_t id = 0;                // creation number (draw list diagnostics)
   uint32_t samples = 1;
   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
   D3D12_CPU_DESCRIPTOR_HANDLE view = {};  // RTV or DSV (render targets only)
+
+  uint32_t host_width() const { return width * scale; }
+  uint32_t host_height() const { return height * scale; }
 };
 
 std::unordered_map<uint64_t, Surface> g_targets;   // EDRAM base | format | pitch
@@ -194,12 +240,13 @@ void Transition(Surface& s, D3D12_RESOURCE_STATES to) {
   s.state = to;
 }
 
+// `width` x `height` in guest pixels; the resource is `scale` times larger.
 bool CreateTexture(Surface& s, DXGI_FORMAT format, uint32_t width, uint32_t height, bool depth,
-                   bool render_target, bool unordered_access = false, uint32_t samples = 1) {
+                   bool render_target, bool unordered_access = false, uint32_t samples = 1, uint32_t scale = 1) {
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  desc.Width = width;
-  desc.Height = height;
+  desc.Width = width * scale;
+  desc.Height = height * scale;
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   // Depth surfaces are typeless so their depth plane can be copied into an
@@ -220,9 +267,12 @@ bool CreateTexture(Surface& s, DXGI_FORMAT format, uint32_t width, uint32_t heig
           (depth || render_target) ? &clear : nullptr, IID_PPV_ARGS(&s.resource)))) {
     return false;
   }
+  static uint32_t surfaces_created = 0;
+  s.id = ++surfaces_created;
   s.format = format;
   s.width = width;
   s.height = height;
+  s.scale = scale;
   s.depth = depth;
   s.unordered_access = unordered_access;
   s.samples = samples;
@@ -258,18 +308,28 @@ void BoundSize(uint8_t* base, uint32_t& width, uint32_t& height) {
   if (!height || height > 8192) height = 720;
 }
 
-// MSAA sample count of the bound targets (RB_SURFACE_INFO.msaa_samples, from
-// the device: the decoded value is stale in tiled passes), 1 when the host
-// can't multisample every target format at that count.
+// The guest's MSAA sample count for the bound targets (RB_SURFACE_INFO.
+// msaa_samples, from the device: the decoded value is stale in tiled passes).
+uint32_t GuestSampleCount(uint8_t* base) {
+  switch ((Dev(base, kDevSurfaceInfo) >> 16) & 3) {
+    case 1: return 2;
+    case 2: return 4;
+    default: return 1;
+  }
+}
+
+// Host MSAA sample count of the bound targets: the guest's, or 4 for the
+// guest's multisampled targets with --tenchuz_native_msaa_samples=4. Lower
+// when the host can't multisample every target format at that count.
 uint32_t SampleCount(uint8_t* base) {
   if (!REXCVAR_GET(tenchuz_native_msaa)) {
     return 1;
   }
-  switch ((Dev(base, kDevSurfaceInfo) >> 16) & 3) {
-    case 1: return g_msaa_2x ? 2 : 1;
-    case 2: return g_msaa_4x ? 4 : 1;
-    default: return 1;
-  }
+  const uint32_t guest = GuestSampleCount(base);
+  const uint32_t wanted = guest > 1 && REXCVAR_GET(tenchuz_native_msaa_samples) >= 4 ? 4 : guest;
+  if (wanted == 4 && g_msaa_4x) return 4;
+  if (wanted >= 2 && g_msaa_2x) return 2;
+  return 1;
 }
 
 Surface* ColorTarget(uint8_t* base, uint32_t index) {
@@ -285,11 +345,11 @@ Surface* ColorTarget(uint8_t* base, uint32_t index) {
     return &it->second;
   }
   Surface s;
-  if (!CreateTexture(s, ColorFormat(format), width, height, false, true, false, samples)) {
+  if (!CreateTexture(s, ColorFormat(format), width, height, false, true, false, samples, g_scale)) {
     return nullptr;
   }
   SetDebugName(s.resource.Get(), fmt::format("tenchuz RT edram {:03X} format {} {}x{} x{}", info & 0xFFF, format,
-                                             width, height, samples));
+                                             s.host_width(), s.host_height(), samples));
   return &g_targets.emplace(key, std::move(s)).first->second;
 }
 
@@ -305,11 +365,11 @@ Surface* DepthTarget(uint8_t* base) {
     return &it->second;
   }
   Surface s;
-  if (!CreateTexture(s, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, width, height, true, false, false, samples)) {
+  if (!CreateTexture(s, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, width, height, true, false, false, samples, g_scale)) {
     return nullptr;
   }
-  SetDebugName(s.resource.Get(),
-               fmt::format("tenchuz depth edram {:03X} {}x{} x{}", info & 0xFFF, width, height, samples));
+  SetDebugName(s.resource.Get(), fmt::format("tenchuz depth edram {:03X} {}x{} x{}", info & 0xFFF, s.host_width(),
+                                             s.host_height(), samples));
   return &g_targets.emplace(key, std::move(s)).first->second;
 }
 
@@ -385,6 +445,7 @@ void EndOp(uint32_t op) {
 }
 
 void ClearColor(Surface& s, const float color[4]) {
+  ++g_frame_clears;
   const uint32_t op = BeginOp("clear colour", s.width, s.height);
   Transition(s, D3D12_RESOURCE_STATE_RENDER_TARGET);
   g_list->ClearRenderTargetView(s.view, color, 0, nullptr);
@@ -392,6 +453,7 @@ void ClearColor(Surface& s, const float color[4]) {
 }
 
 void ClearDepth(Surface& s, float z, uint8_t stencil, D3D12_CLEAR_FLAGS flags) {
+  ++g_frame_clears;
   const uint32_t op = BeginOp("clear depth", s.width, s.height);
   Transition(s, D3D12_RESOURCE_STATE_DEPTH_WRITE);
   g_list->ClearDepthStencilView(s.view, flags, z, stencil, 0, nullptr);
@@ -465,11 +527,12 @@ void main(uint3 id : SV_DispatchThreadID) {
 // The present blit applies the display gamma ramp like the SDK's
 // apply_gamma_table: an 8-bit index per channel into the 256-entry LUT, whose
 // entries hold 10-bit blue, green and red from bit 0 up (DC_LUT_30_COLOR).
+// For FXAA it writes the luma to alpha, like apply_gamma_table_fxaa_luma.
 constexpr char kBlitShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
 StructuredBuffer<uint> ramp : register(t1);
-cbuffer Params : register(b0) { uint src_w; uint src_h; uint dst_w; uint dst_h; uint use_ramp; };
+cbuffer Params : register(b0) { uint src_w; uint src_h; uint dst_w; uint dst_h; uint use_ramp; uint luma; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= dst_w || id.y >= dst_h) return;
@@ -479,9 +542,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint3 i = uint3(saturate(color) * 255.0 + 0.5);
     color = float3((ramp[i.r] >> 20) & 0x3FF, (ramp[i.g] >> 10) & 0x3FF, ramp[i.b] & 0x3FF) / 1023.0;
   }
-  dst[id.xy] = float4(color, 1.0);
+  dst[id.xy] = float4(color, luma ? dot(color, float3(0.299, 0.587, 0.114)) : 1.0);
 }
 )";
+constexpr uint32_t kBlitConstants = 6;
 
 // The display gamma ramp the D3D last wrote to the 256-entry LUT
 // (sub_8242A4F8), as DC_LUT_30_COLOR values, and its per-frame-slot upload.
@@ -531,7 +595,7 @@ bool CreateBlit() {
   params[0].DescriptorTable.NumDescriptorRanges = 2;
   params[0].DescriptorTable.pDescriptorRanges = ranges;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  params[1].Constants.Num32BitValues = 5;
+  params[1].Constants.Num32BitValues = kBlitConstants;
   params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;  // gamma ramp (present only)
   params[2].Descriptor.ShaderRegister = 1;
   D3D12_ROOT_SIGNATURE_DESC root = {};
@@ -548,6 +612,40 @@ bool CreateBlit() {
   pso.CS = {code->GetBufferPointer(), code->GetBufferSize()};
   if (FAILED(g_d3d->CreateComputePipelineState(&pso, IID_PPV_ARGS(&g_blit_pso)))) {
     return false;
+  }
+  // FXAA, with the SDK's root signature: FxaaConstants (size, 1 / size), the
+  // destination UAV and source SRV tables, and a linear clamp sampler.
+  {
+    D3D12_DESCRIPTOR_RANGE dest = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE source = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER fxaa_params[3] = {};
+    fxaa_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    fxaa_params[0].Constants.Num32BitValues = 4;
+    fxaa_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    fxaa_params[1].DescriptorTable = {1, &dest};
+    fxaa_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    fxaa_params[2].DescriptorTable = {1, &source};
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC fxaa_root = {3, fxaa_params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> fxaa_blob;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC fxaa_pso = {};
+    if (SUCCEEDED(serialize(&fxaa_root, D3D_ROOT_SIGNATURE_VERSION_1, &fxaa_blob, &errors)) &&
+        SUCCEEDED(g_d3d->CreateRootSignature(0, fxaa_blob->GetBufferPointer(), fxaa_blob->GetBufferSize(),
+                                             IID_PPV_ARGS(&g_fxaa_root)))) {
+      fxaa_pso.pRootSignature = g_fxaa_root.Get();
+      fxaa_pso.CS = {shaders::fxaa_cs, sizeof(shaders::fxaa_cs)};
+      g_d3d->CreateComputePipelineState(&fxaa_pso, IID_PPV_ARGS(&g_fxaa_pso));
+      fxaa_pso.CS = {shaders::fxaa_extreme_cs, sizeof(shaders::fxaa_extreme_cs)};
+      g_d3d->CreateComputePipelineState(&fxaa_pso, IID_PPV_ARGS(&g_fxaa_extreme_pso));
+    }
+    if (!g_fxaa_pso || !g_fxaa_extreme_pso) {
+      REXLOG_WARN("tenchuz: native FXAA unavailable (root signature or pipeline creation failed)");
+    }
   }
   ComPtr<ID3DBlob> resolve_code;
   if (FAILED(compile(kResolveShader, sizeof(kResolveShader) - 1, "resolve", nullptr, nullptr, "main",
@@ -627,54 +725,151 @@ DXGI_FORMAT ResolveDestFormat(uint32_t color_format) {
 }
 
 Surface* g_present_source = nullptr;
+uint32_t g_present_front_buffer = 0;  // its guest address
+
+// The render target each colour resolve destination was last resolved from,
+// and the one the presented front buffer came from (widescreen HUD draws).
+std::unordered_map<uint32_t, Surface*> g_resolve_sources;
+Surface* g_final_target = nullptr;
+
+// --tenchuz_native_check_presents: each present copies its source (the native
+// front buffer) and the presenter's output to a readback buffer of its frame
+// slot, and the mean brightness of both, in four horizontal bands, is logged
+// once the slot comes round again.
+struct PresentCheck {
+  ComPtr<ID3D12Resource> buffer;
+  uint64_t size = 0;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT source = {}, output = {};
+  DXGI_FORMAT source_format = DXGI_FORMAT_UNKNOWN;
+  uint64_t frame = 0;  // 0: nothing pending
+  uint32_t front_buffer = 0;
+};
+std::array<PresentCheck, kFramesInFlight> g_present_checks;
+
+// Mean brightness (0-255) of four horizontal bands of a mapped copy.
+std::array<float, 4> BandMeans(const uint8_t* data, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, DXGI_FORMAT format) {
+  std::array<float, 4> sums{}, counts{};
+  const uint32_t w = fp.Footprint.Width, h = fp.Footprint.Height;
+  for (uint32_t y = 0; y < h; y += 8) {
+    const uint8_t* row = data + fp.Offset + size_t(y) * fp.Footprint.RowPitch;
+    const uint32_t band = std::min(3u, y * 4 / h);
+    for (uint32_t x = 0; x < w; x += 8) {
+      uint32_t v;
+      std::memcpy(&v, row + 4 * x, 4);
+      float r, g, b;
+      if (format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        r = float(v & 0x3FF) / 4.0f, g = float((v >> 10) & 0x3FF) / 4.0f, b = float((v >> 20) & 0x3FF) / 4.0f;
+      } else {
+        r = float(v & 0xFF), g = float((v >> 8) & 0xFF), b = float((v >> 16) & 0xFF);
+      }
+      sums[band] += (r + g + b) / 3.0f;
+      counts[band] += 1.0f;
+    }
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    sums[i] = counts[i] ? sums[i] / counts[i] : 0.0f;
+  }
+  return sums;
+}
+
+// Logs the check pending in this frame slot (its GPU work is done).
+void LogPresentCheck(PresentCheck& check) {
+  if (!check.frame || !check.buffer) {
+    return;
+  }
+  uint8_t* data = nullptr;
+  const D3D12_RANGE range = {0, SIZE_T(check.size)};
+  if (SUCCEEDED(check.buffer->Map(0, &range, reinterpret_cast<void**>(&data)))) {
+    const auto source = BandMeans(data, check.source, check.source_format);
+    const auto output = BandMeans(data, check.output, rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat);
+    REXLOG_INFO("tenchuz: NATIVE check frame {} fb {:08X}: source bands {:.0f} {:.0f} {:.0f} {:.0f}, output bands "
+                "{:.0f} {:.0f} {:.0f} {:.0f}",
+                check.frame, check.front_buffer, source[0], source[1], source[2], source[3], output[0], output[1],
+                output[2], output[3]);
+    const D3D12_RANGE none = {0, 0};
+    check.buffer->Unmap(0, &none);
+  }
+  check.frame = 0;
+}
 
 bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) {
   auto& d3d12_context =
       static_cast<rex::ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context);
   ID3D12Resource* output = d3d12_context.resource_uav_capable();
   const D3D12_RESOURCE_DESC output_desc = output->GetDesc();
+  const uint32_t width = uint32_t(output_desc.Width), height = output_desc.Height;
   FrameSlot& slot = g_slots[g_frame % kFramesInFlight];
+
+  // FXAA's source: the size of the output, replaced when that changes.
+  const std::string& effect = REXCVAR_GET(tenchuz_native_post_effect);
+  ID3D12PipelineState* fxaa_pso =
+      effect == "fxaa" ? g_fxaa_pso.Get() : (effect == "fxaa_extreme" ? g_fxaa_extreme_pso.Get() : nullptr);
+  if (fxaa_pso && g_fxaa_source) {
+    const D3D12_RESOURCE_DESC desc = g_fxaa_source->GetDesc();
+    if (desc.Width != width || desc.Height != height) {
+      slot.retired.push_back(std::move(g_fxaa_source));  // the previous frame's present may still read it
+    }
+  }
+  if (fxaa_pso && !g_fxaa_source) {
+    Surface fxaa_source;
+    if (CreateTexture(fxaa_source, kFxaaSourceFormat, width, height, false, false, true)) {
+      g_fxaa_source = std::move(fxaa_source.resource);
+      g_fxaa_source_state = fxaa_source.state;
+      SetDebugName(g_fxaa_source.Get(), "tenchuz FXAA source");
+    } else {
+      fxaa_pso = nullptr;
+    }
+  }
 
   slot.present_allocator->Reset();
   g_present_list->Reset(slot.present_allocator.Get(), nullptr);
+  auto barrier = [](ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = resource;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = after;
+    return b;
+  };
   Surface& source = *g_present_source;
-  D3D12_RESOURCE_BARRIER barriers[2] = {};
-  int barrier_count = 0;
+  // The blit writes the presenter's output, or FXAA's source.
+  ID3D12Resource* blit_dest = fxaa_pso ? g_fxaa_source.Get() : output;
+  D3D12_RESOURCE_BARRIER barriers[3];
+  UINT barrier_count = 0;
   if (source.state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
-    barriers[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[barrier_count].Transition.pResource = source.resource.Get();
-    barriers[barrier_count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[barrier_count].Transition.StateBefore = source.state;
-    barriers[barrier_count].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    ++barrier_count;
+    barriers[barrier_count++] =
+        barrier(source.resource.Get(), source.state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     source.state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   }
-  barriers[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barriers[barrier_count].Transition.pResource = output;
-  barriers[barrier_count].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  barriers[barrier_count].Transition.StateBefore = rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
-  barriers[barrier_count].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  ++barrier_count;
+  barriers[barrier_count++] = barrier(output, rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (fxaa_pso && g_fxaa_source_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    barriers[barrier_count++] =
+        barrier(g_fxaa_source.Get(), g_fxaa_source_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_fxaa_source_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  }
   g_present_list->ResourceBarrier(barrier_count, barriers);
 
-  // Two descriptors per frame slot: source SRV, output UAV.
-  const uint32_t first = uint32_t(g_frame % kFramesInFlight) * 2;
+  // kPresentDescriptors per frame slot: blit source SRV and destination UAV,
+  // then FXAA source SRV and destination UAV.
+  const uint32_t first = uint32_t(g_frame % kFramesInFlight) * kPresentDescriptors;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_shader_heap->GetCPUDescriptorHandleForHeapStart();
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_shader_heap->GetGPUDescriptorHandleForHeapStart();
   cpu.ptr += SIZE_T(first) * g_shader_size;
   gpu.ptr += UINT64(first) * g_shader_size;
+  auto cpu_at = [&](uint32_t i) { return D3D12_CPU_DESCRIPTOR_HANDLE{cpu.ptr + SIZE_T(i) * g_shader_size}; };
+  auto gpu_at = [&](uint32_t i) { return D3D12_GPU_DESCRIPTOR_HANDLE{gpu.ptr + UINT64(i) * g_shader_size}; };
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = source.format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   srv.Texture2D.MipLevels = 1;
-  g_d3d->CreateShaderResourceView(source.resource.Get(), &srv, cpu);
-  D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
-  cpu_uav.ptr += g_shader_size;
+  g_d3d->CreateShaderResourceView(source.resource.Get(), &srv, cpu_at(0));
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
-  uav.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  uav.Format = fxaa_pso ? kFxaaSourceFormat : rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
   uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-  g_d3d->CreateUnorderedAccessView(output, nullptr, &uav, cpu_uav);
+  g_d3d->CreateUnorderedAccessView(blit_dest, nullptr, &uav, cpu_at(1));
 
   ID3D12DescriptorHeap* heaps[] = {g_shader_heap.Get()};
   g_present_list->SetDescriptorHeaps(1, heaps);
@@ -689,24 +884,100 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
     std::memcpy(g_gamma_upload_map + ramp_offset, g_gamma_ramp.data(), kGammaRampBytes);
   }
   g_present_list->SetComputeRootShaderResourceView(2, g_gamma_upload->GetGPUVirtualAddress() + ramp_offset);
-  const uint32_t constants[5] = {source.width, source.height, uint32_t(output_desc.Width), output_desc.Height,
-                                 uint32_t(use_ramp)};
-  g_present_list->SetComputeRoot32BitConstants(1, 5, constants, 0);
+  const uint32_t constants[kBlitConstants] = {source.host_width(), source.host_height(), width, height,
+                                              uint32_t(use_ramp), uint32_t(fxaa_pso != nullptr)};
+  g_present_list->SetComputeRoot32BitConstants(1, kBlitConstants, constants, 0);
   const uint32_t op =
       g_draw_path ? g_draw_path->BeginOp(g_present_list.Get(), "present blit", source.width, source.height) : 0;
-  g_present_list->Dispatch((constants[2] + 7) / 8, (constants[3] + 7) / 8, 1);
+  g_present_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
   if (g_draw_path) {
     g_draw_path->EndOp(op);
   }
 
-  std::swap(barriers[barrier_count - 1].Transition.StateBefore,
-            barriers[barrier_count - 1].Transition.StateAfter);
-  g_present_list->ResourceBarrier(1, &barriers[barrier_count - 1]);
+  if (fxaa_pso) {
+    // Like the SDK's swap: FxaaConstants, 16x8 thread groups.
+    const D3D12_RESOURCE_BARRIER to_source = barrier(g_fxaa_source.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_present_list->ResourceBarrier(1, &to_source);
+    g_fxaa_source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    srv.Format = kFxaaSourceFormat;
+    g_d3d->CreateShaderResourceView(g_fxaa_source.Get(), &srv, cpu_at(2));
+    uav.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    g_d3d->CreateUnorderedAccessView(output, nullptr, &uav, cpu_at(3));
+    g_present_list->SetComputeRootSignature(g_fxaa_root.Get());
+    g_present_list->SetPipelineState(fxaa_pso);
+    uint32_t fxaa_constants[4] = {width, height, 0, 0};
+    const float size_inv[2] = {1.0f / float(width), 1.0f / float(height)};
+    std::memcpy(&fxaa_constants[2], size_inv, sizeof(size_inv));
+    g_present_list->SetComputeRoot32BitConstants(0, 4, fxaa_constants, 0);
+    g_present_list->SetComputeRootDescriptorTable(1, gpu_at(3));
+    g_present_list->SetComputeRootDescriptorTable(2, gpu_at(2));
+    const uint32_t fxaa_op = g_draw_path ? g_draw_path->BeginOp(g_present_list.Get(), "present FXAA", width, height) : 0;
+    g_present_list->Dispatch((width + 15) / 16, (height + 7) / 8, 1);
+    if (g_draw_path) {
+      g_draw_path->EndOp(fxaa_op);
+    }
+  }
+
+  D3D12_RESOURCE_STATES output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  if (REXCVAR_GET(tenchuz_native_check_presents) &&
+      (source.format == DXGI_FORMAT_R8G8B8A8_UNORM || source.format == DXGI_FORMAT_R10G10B10A2_UNORM)) {
+    PresentCheck& check = g_present_checks[g_frame % kFramesInFlight];
+    const D3D12_RESOURCE_DESC source_desc = source.resource->GetDesc();
+    UINT64 source_size = 0, output_size = 0;
+    g_d3d->GetCopyableFootprints(&source_desc, 0, 1, 0, &check.source, nullptr, nullptr, &source_size);
+    const UINT64 output_offset = (source_size + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+                                 ~UINT64(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+    g_d3d->GetCopyableFootprints(&output_desc, 0, 1, output_offset, &check.output, nullptr, nullptr, &output_size);
+    const uint64_t size = output_offset + output_size;
+    if (!check.buffer || check.size < size) {
+      D3D12_RESOURCE_DESC buffer = {};
+      buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      buffer.Width = size;
+      buffer.Height = 1;
+      buffer.DepthOrArraySize = 1;
+      buffer.MipLevels = 1;
+      buffer.SampleDesc.Count = 1;
+      buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      check.buffer.Reset();
+      check.size = 0;
+      if (SUCCEEDED(g_d3d->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesReadback,
+                                                   D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   nullptr, IID_PPV_ARGS(&check.buffer)))) {
+        check.size = size;
+      }
+    }
+    if (check.buffer) {
+      D3D12_RESOURCE_BARRIER to_copy[2] = {
+          barrier(source.resource.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_COPY_SOURCE),
+          barrier(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+      g_present_list->ResourceBarrier(2, to_copy);
+      D3D12_TEXTURE_COPY_LOCATION from = {source.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+      D3D12_TEXTURE_COPY_LOCATION to = {check.buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+      to.PlacedFootprint = check.source;
+      g_present_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+      from.pResource = output;
+      to.PlacedFootprint = check.output;
+      g_present_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+      const D3D12_RESOURCE_BARRIER source_back = barrier(source.resource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      g_present_list->ResourceBarrier(1, &source_back);
+      output_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      check.source_format = source.format;
+      check.frame = g_frame;
+      check.front_buffer = g_present_front_buffer;
+    }
+  }
+  const D3D12_RESOURCE_BARRIER output_back =
+      barrier(output, output_state, rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  g_present_list->ResourceBarrier(1, &output_back);
   g_present_list->Close();
 
   ID3D12CommandList* lists[] = {g_present_list.Get()};
   g_provider->GetDirectQueue()->ExecuteCommandLists(1, lists);
-  context.SetIs8bpc(true);
+  // Like the SDK's swap: FXAA's output has more than 8 bits of precision.
+  context.SetIs8bpc(fxaa_pso == nullptr);
   return true;
 }
 
@@ -745,6 +1016,7 @@ class FrameHost final : public DrawHost {
     Transition(*s, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     out.resource = s->resource.Get();
     out.format = s->format;
+    out.resolution_scaled = s->scale > 1;
     // Guest X/Y/Z/W -> host components: RGBA, R/B swapped by the resolve, or
     // the SDK's RRRR / RGGG for one- and two-component formats.
     switch (s->format) {
@@ -845,24 +1117,33 @@ void OnLiveDraw(const pm4::DrawInfo& draw, const pm4::Decoder& state, uint8_t* b
   }
   DrawTarget target;
   target.color_mask = color_mask;
+  target.color_info = Dev(base, kDevColorInfo);
+  target.depth_info = Dev(base, kDevDepthInfo);
+  target.color_surface = colors[0] ? colors[0]->id : 0;
+  target.depth_surface = depth ? depth->id : 0;
+  if (colors[0] && colors[0] == g_final_target) {
+    target.hud_scale_x = widescreen::HudScaleX();
+  }
   for (uint32_t i = 0; i < 4; ++i) {
     target.rtvs[i] = g_null_rtv;
     if (colors[i]) {
       Transition(*colors[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
       target.color_formats[i] = colors[i]->format;
       target.rtvs[i] = colors[i]->view;
-      target.width = colors[i]->width;
-      target.height = colors[i]->height;
+      target.width = colors[i]->host_width();
+      target.height = colors[i]->host_height();
       target.samples = colors[i]->samples;
+      target.resolution_scale = colors[i]->scale;
     }
   }
   if (depth) {
     Transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     target.depth_format = depth->format;
     target.dsv = depth->view;
-    target.width = depth->width;
-    target.height = depth->height;
+    target.width = depth->host_width();
+    target.height = depth->host_height();
     target.samples = depth->samples;
+    target.resolution_scale = depth->scale;
   }
   g_draw_path->Draw(g_list.Get(), draw, state, base, g_device, shaders, target, &g_frame_host);
 }
@@ -917,8 +1198,8 @@ void DumpResolvedTextures() {
     }
     Readback r;
     r.address = uint32_t(key);
-    r.width = s.width;
-    r.height = s.height;
+    r.width = s.host_width();
+    r.height = s.host_height();
     r.format = s.format;
     const D3D12_RESOURCE_DESC desc = s.resource->GetDesc();
     UINT64 total = 0;
@@ -1014,6 +1295,7 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
   if (!g_recording) {
     WaitForSlot();  // the present list reuses this slot's allocator
   }
+  LogPresentCheck(g_present_checks[g_frame % kFramesInFlight]);
   const DrawStats draw_stats = g_draw_path ? g_draw_path->TakeFrameStats() : DrawStats{};
   const gpu_observer::ResyncStats rs = gpu_observer::TakeResyncStats();
   if (draw_stats.stale_pages) {  // --tenchuz_native_recheck_pages
@@ -1031,10 +1313,11 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
                 "{} copy-mode draws skipped in total",
                 g_frame_draws, g_frame_draws_ready, st.unique_shaders, st.translations, st.failures,
                 st.copy_mode_draws);
-    REXLOG_INFO("tenchuz: NATIVE issued {} draws ({} to several targets, {} with stencil); skipped {} primitive "
-                "type (types mask {:X}), {} pipeline, {} culled, {} other; uploaded {} KB, {} KB per draw "
+    REXLOG_INFO("tenchuz: NATIVE issued {} draws ({} to several targets, {} with stencil, {} kept at 16:9); skipped "
+                "{} primitive type (types mask {:X}), {} pipeline, {} culled, {} other; uploaded {} KB, {} KB per draw "
                 "(dynamic); {} reset indices converted",
-                draw_stats.issued, draw_stats.mrt_draws, draw_stats.stencil_draws, draw_stats.skipped_primitive,
+                draw_stats.issued, draw_stats.mrt_draws, draw_stats.stencil_draws, draw_stats.hud_draws,
+                draw_stats.skipped_primitive,
                 draw_stats.skipped_primitive_types, draw_stats.skipped_pipeline, draw_stats.skipped_culled,
                 draw_stats.skipped_other, draw_stats.uploaded_kb, draw_stats.arena_kb, draw_stats.reset_converted);
     REXLOG_INFO("tenchuz: NATIVE decode: {} kicks, {} segment switches, {} gap ({} KB), {} backward, {} stuck "
@@ -1066,15 +1349,34 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
     REXLOG_INFO("tenchuz: NATIVE draws by function/opcode: {}", kinds);
   }
   g_draw_kinds.clear();
+  if (REXCVAR_GET(tenchuz_native_log_presents)) {
+    const Surface* shown = it != g_latest_texture.end() ? it->second : nullptr;
+    REXLOG_INFO("tenchuz: NATIVE frame {} {} {:08X}: {}; {} draws ({} issued), {} resolves, {} clears", g_frame,
+                present ? "present" : "end", front_buffer,
+                shown ? fmt::format("resolved {} frames ago", g_frame - shown->resolved_frame)
+                      : std::string("not resolved natively"),
+                g_frame_draws, draw_stats.issued, g_frame_resolves, g_frame_clears);
+  }
   g_frame_draws = g_frame_draws_ready = 0;
+  g_frame_resolves = g_frame_clears = 0;
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE {} front buffer {:08X} {}x{}: {}", present ? "present" : "frame end",
                 front_buffer, width, height,
                 it != g_latest_texture.end() ? "native texture" : "not resolved natively");
   }
+  // The next frame's 2D draws on this target keep 16:9 with a wider aspect.
+  if (auto source = g_resolve_sources.find(front_buffer); source != g_resolve_sources.end()) {
+    g_final_target = source->second;
+  }
   if (present && it != g_latest_texture.end()) {
     g_present_source = it->second;
-    g_presenter->RefreshGuestOutput(width, height, 16, 9, RefreshGuestOutput);
+    g_present_front_buffer = front_buffer;
+    // At the front buffer's resolution scale and the aspect ratio the game
+    // renders for (widescreen.h): the presenter fits it to the window.
+    const uint32_t scale = g_present_source->scale;
+    uint32_t aspect_x, aspect_y;
+    widescreen::AspectFraction(aspect_x, aspect_y);
+    g_presenter->RefreshGuestOutput(width * scale, height * scale, aspect_x, aspect_y, RefreshGuestOutput);
   }
   FrameSlot& slot = g_slots[g_frame % kFramesInFlight];
   slot.fence_value = ++g_fence_counter;
@@ -1083,6 +1385,14 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
     --g_log_frames;
   }
   ++g_frame;
+  // --tenchuz_native_trace_syncs_at: the command-stream decoding of the next frame.
+  const int32_t trace_at = REXCVAR_GET(tenchuz_native_trace_syncs_at);
+  const bool trace = trace_at > 0 && g_frame >= uint64_t(trace_at) &&
+                     g_frame < uint64_t(trace_at) + uint64_t(std::max(1, REXCVAR_GET(tenchuz_native_trace_syncs_frames)));
+  if (trace) {
+    REXLOG_INFO("tenchuz: observe trace of native frame {}", g_frame);
+  }
+  gpu_observer::SetSyncTrace(trace);
 }
 
 bool CreateResources() {
@@ -1118,7 +1428,7 @@ bool CreateResources() {
   heap.NumDescriptors = kDsvCapacity;
   if (FAILED(g_d3d->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_dsv_heap)))) return false;
   heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  heap.NumDescriptors = kFramesInFlight * (2 + kResolveDescriptors);
+  heap.NumDescriptors = kFramesInFlight * (kPresentDescriptors + kResolveDescriptors);
   heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (FAILED(g_d3d->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&g_shader_heap)))) return false;
   SetDebugName(g_shader_heap.Get(), "tenchuz present/resolve descriptor heap");
@@ -1289,7 +1599,15 @@ void Initialize(rex::Runtime* runtime) {
     factory->EnumAdapterByLuid(g_d3d->GetAdapterLuid(), IID_PPV_ARGS(&g_adapter));
   }
   if (g_ready) {
-    g_shaders = std::make_unique<ShaderCache>(g_provider->GetAdapterVendorID());
+    g_scale = uint32_t(std::clamp(REXCVAR_GET(tenchuz_native_resolution_scale), 1, 4));
+    if (g_scale > 1) {
+      REXLOG_INFO("tenchuz: native resolution scale {}x", g_scale);
+    }
+    if (REXCVAR_GET(tenchuz_native_msaa_samples) >= 4) {
+      REXLOG_INFO("tenchuz: native MSAA: 4x for the game's multisampled targets{}",
+                  g_msaa_4x ? "" : " unsupported by this GPU");
+    }
+    g_shaders = std::make_unique<ShaderCache>(g_provider->GetAdapterVendorID(), g_scale);
     g_draw_path = std::make_unique<DrawPath>();
     if (!g_draw_path->Initialize(g_d3d, runtime->memory())) {
       REXLOG_WARN("tenchuz: native draw path unavailable (D3D12 resource creation failed)");
@@ -1300,7 +1618,7 @@ void Initialize(rex::Runtime* runtime) {
   REXLOG_INFO("tenchuz: native renderer {} (F10 toggles native output)",
               g_ready ? "ready" : "failed to create D3D12 resources");
   g_log_frames = REXCVAR_GET(tenchuz_native_log_frames);
-  if (g_ready && REXCVAR_GET(tenchuz_native_output)) {
+  if (g_ready && (REXCVAR_GET(tenchuz_native_output) || NativeGpu())) {
     TogglePresentNative();
   }
 }
@@ -1323,6 +1641,10 @@ void TogglePresentNative() {
   }
   last = time;
   const bool now = !g_present_native.load();
+  if (!now && NativeGpu()) {
+    REXLOG_INFO("tenchuz: no GPU emulation to switch to (--tenchuz_native_gpu)");
+    return;
+  }
   if (now && !g_ready) {
     REXLOG_WARN("tenchuz: native renderer not ready");
     return;
@@ -1459,15 +1781,17 @@ void OnBeginTiling(uint8_t* base, uint32_t count, uint32_t rects) {
 
 // The samples a resolve of `src` reads (RB_COPY_CONTROL.copy_sample_select,
 // captured during Resolve), packed for the MSAA resolve shaders: first sample
-// in bits 0-1, count in bits 2-4. All samples when it wasn't captured.
-uint32_t ResolveSamples(const Surface& src) {
+// in bits 0-1, count in bits 2-4. All samples when it wasn't captured, or when
+// the selection is every guest sample (`guest_samples`) of a target the host
+// multisamples more (--tenchuz_native_msaa_samples).
+uint32_t ResolveSamples(const Surface& src, uint32_t guest_samples) {
   uint32_t first = 0, count = src.samples;
   if (g_copy_control && src.samples > 1) {
     const uint32_t select = (g_copy_control >> 4) & 7;
     if (select <= 3) {
       first = std::min(select, src.samples - 1);
       count = 1;
-    } else if (select <= 5) {
+    } else if (select <= 5 && guest_samples > 2) {
       first = select == 5 && src.samples >= 4 ? 2 : 0;
       count = 2;
     }
@@ -1485,7 +1809,8 @@ bool ResolveCompute(Surface& src, DXGI_FORMAT srv_format, Surface& dst, DXGI_FOR
   }
   Transition(src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   Transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  const uint32_t first = kFramesInFlight * 2 + uint32_t(g_frame % kFramesInFlight) * kResolveDescriptors + used;
+  const uint32_t first =
+      kFramesInFlight * kPresentDescriptors + uint32_t(g_frame % kFramesInFlight) * kResolveDescriptors + used;
   used += 2;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_shader_heap->GetCPUDescriptorHandleForHeapStart();
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_shader_heap->GetGPUDescriptorHandleForHeapStart();
@@ -1535,22 +1860,26 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
       g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(dst.resource));
     }
     dst = Surface();
-    if (!CreateTexture(dst, DXGI_FORMAT_R32_TYPELESS, src->width, src->height, false, false, msaa)) {
+    if (!CreateTexture(dst, DXGI_FORMAT_R32_TYPELESS, src->width, src->height, false, false, msaa, 1, src->scale)) {
       if (g_latest_texture[dest] == &dst) {
         g_latest_texture.erase(dest);
       }
       g_textures.erase(key);
       return;
     }
-    SetDebugName(dst.resource.Get(), fmt::format("tenchuz depth resolve {:08X} {}x{}", dest, src->width, src->height));
+    SetDebugName(dst.resource.Get(),
+                 fmt::format("tenchuz depth resolve {:08X} {}x{}", dest, dst.host_width(), dst.host_height()));
   }
   g_latest_texture[dest] = &dst;
   dst.red_blue_swapped = false;
+  dst.resolved_frame = g_frame;
+  ++g_frame_resolves;
   const uint32_t op = BeginOp("resolve depth", dest, (src->width << 16) | src->height);
   bool done = true;
   if (msaa) {
     done = ResolveCompute(*src, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, dst, DXGI_FORMAT_R32_FLOAT,
-                          g_resolve_depth_msaa_pso.Get(), src->width, src->height, 1.0f, ResolveSamples(*src) & 3);
+                          g_resolve_depth_msaa_pso.Get(), src->host_width(), src->host_height(), 1.0f,
+                          ResolveSamples(*src, GuestSampleCount(base)) & 3);
   } else {
     Transition(*src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1646,31 +1975,34 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
       g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(dst.resource));
     }
     dst = Surface();
-    if (!CreateTexture(dst, dest_format, copy_width, copy_height, false, false, convert)) {
+    if (!CreateTexture(dst, dest_format, copy_width, copy_height, false, false, convert, 1, src->scale)) {
       if (g_latest_texture[dest] == &dst) {
         g_latest_texture.erase(dest);
       }
       g_textures.erase(key);
       return;
     }
-    SetDebugName(dst.resource.Get(), fmt::format("tenchuz resolve {:08X} {}x{} format {}", dest, copy_width,
-                                                 copy_height, int(dest_format)));
+    SetDebugName(dst.resource.Get(), fmt::format("tenchuz resolve {:08X} {}x{} format {}", dest, dst.host_width(),
+                                                 dst.host_height(), int(dest_format)));
   }
   g_latest_texture[dest] = &dst;
+  g_resolve_sources[dest] = src;
+  dst.resolved_frame = g_frame;
+  ++g_frame_resolves;
   dst.red_blue_swapped = (dest_info >> 24) & 1;
   const uint32_t op = BeginOp("resolve copy", dest, (dest_width << 16) | dest_height);
   bool done = true;
   if (convert) {
     // A cross-format copy would be invalid: skipped when there's no pass.
     done = ResolveCompute(*src, src->format, dst, dest_format,
-                          src->samples > 1 ? g_resolve_msaa_pso.Get() : g_resolve_pso.Get(), copy_width,
-                          copy_height, std::ldexp(1.0f, exp_bias), ResolveSamples(*src));
+                          src->samples > 1 ? g_resolve_msaa_pso.Get() : g_resolve_pso.Get(), dst.host_width(),
+                          dst.host_height(), std::ldexp(1.0f, exp_bias), ResolveSamples(*src, GuestSampleCount(base)));
   } else {
     Transition(*src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION to = {dst.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     D3D12_TEXTURE_COPY_LOCATION from = {src->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    D3D12_BOX box = {0, 0, 0, copy_width, copy_height, 1};
+    D3D12_BOX box = {0, 0, 0, dst.host_width(), dst.host_height(), 1};
     g_list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
   }
   EndOp(op);
@@ -1765,7 +2097,8 @@ void TenchuzAfterVdSwap(PPCRegister& r29) {
     const uint32_t front_buffer = REX_LOAD_U32(block + 4 * (i + 2));
     const uint32_t width = REX_LOAD_U32(block + 4 * (i + 3));
     const uint32_t height = REX_LOAD_U32(block + 4 * (i + 4));
-    if (present) {
+    // Without GPU emulation, the native command processor only counts swaps.
+    if (present && !tenchuz::native::NativeGpu()) {
       const uint32_t size = 1 + ((header >> 16) & 0x3FFF) + 1;
       for (uint32_t k = 0; k < size && i + k < 64; ++k) {
         REX_STORE_U32(block + 4 * (i + k), 0x80000000u);  // type-2 NOP
