@@ -82,6 +82,14 @@ class TextureLoader {
 
   Stats TakeFrameStats();
 
+  // Write tracking of guest physical memory (--tenchuz_native_texture_watch),
+  // also used for geometry uploads. WatchingWrites() is false without it.
+  bool WatchingWrites() const;
+  uint32_t WriteSequence() const;
+  // Whether a page in [physical, physical + size) was written after `sequence`.
+  bool WrittenSince(uint32_t physical, uint32_t size, uint32_t sequence) const;
+  void Watch(uint32_t physical, uint32_t size);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

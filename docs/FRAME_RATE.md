@@ -1,4 +1,51 @@
-# Frame rate (Track F): research
+# Frame rate (Track F)
+
+## Result (2026-10-20)
+
+60 fps is the default (`src/frame_rate.cpp`). `--tenchuz_frame_rate=30` restores the original cap;
+120-240 are supported too (below).
+
+- **How:** the hook on `SetRenderState(D3DRS_PRESENTINTERVAL)` (`sub_824194A0`) turns
+  interval 2 into 1. Each Swap then picks the interval per frame (below).
+- **Frame-rate independent at 60 (checked side by side with 30):** player movement (a timed
+  walk ends at the same spot), jump arc, attack animation, stealth meter, camera, and the
+  mission movies.
+- **Frame-counted at 60:** the 2D screens. Title, menus, briefings and loading screens animate
+  with fixed per-frame steps, written screen by screen. For example `sub_822A29B8` (the title's
+  highlight, alpha +8 and -12 a frame) runs from the task list `sub_822A1E30`. So their fades and
+  transitions ran twice as fast; the title dim after Start took 366 ms instead of 734.
+- **The fix (`--tenchuz_menus_at_30`, default on):** frames with no depth-tested draw (no 3D
+  scene, counted by the native renderer) keep interval 2. 3D frames get interval 1, after 2 in
+  a row; 2D after 8 in a row, so a black frame between cuts doesn't flip it. With it, the title
+  dim is 734 ms again, and the briefing and opening movie line up with a 30 fps run.
+- **The pause menu** steps per frame too. While it is open (the UI task list's pause mode at
+  `0x82B5A650` is nonzero; found by diffing the game's globals paused against playing), frames
+  keep interval 2, so it animates at the original speed.
+- Still per frame at the full rate: the village prompts' quick fade-in ("Accept mission"). No
+  single game flag marks them: a diff of the game's globals found none.
+- **Above 60 fps (2026-10-21):** `--tenchuz_frame_rate` (or the Esc menu) takes 120, 144, 165,
+  180 or 240. The D3D paces frames in guest vblanks, so in 3D scenes the native GPU raises them at
+  that rate (`native::SetVblankRate`) with interval 1; 2D screens and the pause menu go back to
+  60 Hz vblanks and interval 2 (30 fps).
+- **Pacing:** the process now runs at 1 ms timer resolution (`timeBeginPeriod`), and the
+  vblank thread waits on a high-resolution waitable timer. Before, `Sleep(1)` slept a 15.6 ms
+  scheduler tick, so vblanks arrived in bursts and frames topped out near 64 fps.
+- **Fixed 1/30 s steps:** effect objects add the constant `0x821DBCA8` (1/30) to timers each
+  frame, in 8 methods at `0x823EBF90`-`0x82408938`. At 60 fps the constant is rewritten each
+  frame to the measured frame time (`0x82B577BC`).
+- **Performance:** the menus and the village hold 60. Mission 1 averaged about 54 until the
+  native renderer stopped hashing every draw's vertex-shader constants; it now holds 60.
+  Uncapped (2026-10-21), after the CPU and GPU stopped waiting for each other every frame and
+  the SDK's timer thread stopped spinning (`src/sdk_fixes.cpp`): the village runs at about 185
+  fps and Mission 1 at 80-120 on this PC (RX 6600). The main thread is then the limit; its
+  biggest single cost is the game's own D3DX mesh tests (`sub_82441DB8`, about a quarter).
+
+Tools that came out of this: `--tenchuz_profile_at` / F7 (sampling profiler,
+`src/profiler.cpp`), `--tenchuz_dump_memory_at_frame` with `tools/find_frame_steps.py`
+(values that step evenly per frame), and `--tenchuz_watch_write` (hardware write watchpoint
+that logs the writer's call stack), in `src/debug_tools.cpp`.
+
+## Research
 
 Research for milestones F1 (unlock 60 fps) and F2 (simulation timestep) of
 [NATIVE_PORT_PLAN.md](NATIVE_PORT_PLAN.md). It comes from static analysis of `game/default.pe` and two

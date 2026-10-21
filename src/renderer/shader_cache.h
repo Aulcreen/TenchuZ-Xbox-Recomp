@@ -30,6 +30,7 @@ struct ShaderStats {
   uint64_t translations = 0;
   uint64_t copy_mode_draws = 0;  // RB_MODECONTROL in copy mode: resolves, not drawn
   uint64_t failures = 0;
+  double translate_ms = 0;  // time spent translating, in total
 };
 
 class ShaderCache {

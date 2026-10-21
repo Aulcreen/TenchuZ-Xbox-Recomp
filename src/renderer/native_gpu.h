@@ -25,4 +25,8 @@ bool NativeGpu();
 
 std::unique_ptr<rex::system::IGraphicsSystem> CreateNativeGraphicsSystem();
 
+// The guest vblank rate in Hz (0: the video mode's, 60). The D3D paces frames
+// in vblanks, so frame_rate.cpp raises it for frame rates above 60.
+void SetVblankRate(double hz);
+
 }  // namespace tenchuz::native

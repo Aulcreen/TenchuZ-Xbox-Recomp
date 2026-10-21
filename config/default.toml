@@ -8,6 +8,13 @@ setjmp_address = 0x82657B00
 # longjmp: restores f14-f31 / r13-r31 from jmp_buf, calls RtlUnwind
 longjmp_address = 0x826578C0
 
+# Register-local codegen options (ctr/xer/cr/non_volatile/non_argument_as_local,
+# skip_msr) were tried on 2026-10-20 and are off: skip_msr and
+# non_argument_as_local hang the first loading screen, and the remaining set
+# corrupts the software WMV decoder (intro and mission movies turn into purple
+# and green stripes), for only ~4% less main-thread time in Mission 1. Bisect
+# them per option (and per function, with share_registers) before trying again.
+
 # Functions with no .pdata entry that are only reached via tail branches.
 [functions]
 # C++ this-adjustor thunk: addi r3,r3,4 ; b 0x82516B10

@@ -21,10 +21,11 @@ parser.add_argument("--end", default="0x82450000")
 # (~500k calls per frame, would flood the capture buffer). 0x8241B308 Clear and
 # 0x8241D770 Resolve, 0x8241A780 SetRenderTarget, 0x8241C790 BeginTiling: hooked in
 # renderer/native_renderer.cpp (HookScope keeps them traced), as is 0x8242A4F8 (gamma
-# ramp to the display LUT).
+# ramp to the display LUT). 0x824194A0: SetRenderState(PRESENTINTERVAL), hooked in
+# frame_rate.cpp. 0x824103F8: XInputGetState, hooked in input/pc_input.cpp.
 parser.add_argument("--exclude", nargs="*",
                     default=["0x8241BF50", "0x82425790", "0x8241B308", "0x8241D770", "0x8241A780",
-                             "0x8241C790", "0x8242A4F8"])
+                             "0x8241C790", "0x8242A4F8", "0x824194A0", "0x824103F8"])
 parser.add_argument("--init", default="generated/default/tenchuz_init.cpp")
 parser.add_argument("--out", default="src/renderer/d3d_trace_hooks.gen.cpp")
 args = parser.parse_args()

@@ -13,16 +13,19 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/bit.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+#include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -35,6 +38,8 @@
 
 REXCVAR_DEFINE_BOOL(tenchuz_native_ring_flush, false, "tenchuz",
                     "Native draws: flush mid-frame when command-ring vertex pages are rewritten");
+REXCVAR_DEFINE_BOOL(tenchuz_native_geometry_watch, true, "tenchuz",
+                    "Copy vertex and index data to the GPU only when the game writes it (false: every frame)");
 REXCVAR_DEFINE_INT32(tenchuz_native_recheck_pages, 0, "tenchuz",
                      "Native draws: 1 = count static vertex/index pages whose guest memory changed after "
                      "this frame uploaded them, 2 = also upload them again");
@@ -48,6 +53,9 @@ REXCVAR_DEFINE_BOOL(tenchuz_native_draw_queries, false, "tenchuz",
                     "Native draws: occlusion query per draw, listed with tenchuz_native_log_draws");
 REXCVAR_DEFINE_BOOL(tenchuz_native_debug_textures, false, "tenchuz",
                     "Native draws sample a UV-gradient checker instead of white (geometry check)");
+REXCVAR_DEFINE_BOOL(tenchuz_native_log_textures, false, "tenchuz",
+                    "Native draws: log each distinct texture fetch once, with how it was bound and any "
+                    "resolve destination a guest texture overlaps");
 REXCVAR_DEFINE_BOOL(tenchuz_native_log_offscreen, false, "tenchuz",
                     "Native draws: log screen-space draws (vertex shaders without float constants) whose "
                     "vertices reach far off screen or aren't finite");
@@ -341,10 +349,33 @@ struct DrawPath::Impl {
   uint8_t* shared_map = nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS shared_gpu = 0;
   std::vector<uint64_t> uploaded_pages = std::vector<uint64_t>(kSharedMemorySize >> kPageShift >> 6);
+  // The last frame (frame_counter) whose draws read each mirror page. The
+  // GPU may still be running the previous frame while this one is recorded.
+  std::vector<uint32_t> page_used_frame = std::vector<uint32_t>(kSharedMemorySize >> kPageShift);
+  DrawHost* frame_host = nullptr;  // the host of the draw being recorded (WaitForPreviousFrame)
+  uint32_t waited_frame = 0;       // frame_counter at the last WaitForPreviousFrame
+
+  // Before overwriting mirror pages [page, page_end) in place: if the
+  // previous frame read any of them, let it finish first.
+  void BeforeOverwrite(uint32_t page, uint32_t page_end) {
+    const uint32_t previous = uint32_t(frame_counter) - 1;
+    if (waited_frame == uint32_t(frame_counter) || !frame_host) return;
+    for (uint32_t p = page; p < page_end; ++p) {
+      if (page_used_frame[p] == previous) {
+        frame_host->WaitForPreviousFrame();
+        waited_frame = uint32_t(frame_counter);
+        ++stats.previous_frame_waits;
+        return;
+      }
+    }
+  }
   std::unordered_map<uint32_t, uint64_t> page_hashes;  // command-ring pages copied this frame
   // --tenchuz_native_recheck_pages: hash of each static page when this frame
   // uploaded it, and what the current draw is uploading (for the log).
   std::unordered_map<uint32_t, uint64_t> static_page_hashes;
+  // Per page: the loader's write sequence when it was last copied, plus 1 (0:
+  // never), for watched geometry (Upload).
+  std::vector<uint32_t> page_copy_sequence = std::vector<uint32_t>(kSharedMemorySize >> kPageShift);
   uint32_t upload_context = 0, upload_context_size = 0;
   uint32_t stale_logged = 0;
   // --tenchuz_native_check_late_writes: every guest range copied this frame
@@ -466,9 +497,13 @@ struct DrawPath::Impl {
     uint32_t query;  // occlusion query index + 1 (--tenchuz_native_draw_queries), 0 = none
     uint32_t target_width, target_height, samples;  // host pixels
     uint32_t guest_textures, resolved_textures;
+    uint32_t textures[6];  // bound texture addresses, bit 0 set for resolved targets (draw list)
     bool depth_test, hud;  // hud: kept at 16:9 (DrawTarget::hud_scale_x)
     float ndc_scale[2], ndc_offset[2];
-    uint32_t vs_constants_hash;  // of the packed VS float constants
+    // The packed VS float constants, still in the slot's constant ring when
+    // the slot's draw list is logged; hashed only then (it costs a lot per draw).
+    const uint8_t* vs_constants;
+    uint32_t vs_constants_size;
     uint32_t packet;             // guest address of the draw packet
     uint32_t color_info, depth_info, color_surface, depth_surface;  // DrawTarget diagnostics
   };
@@ -537,15 +572,20 @@ struct DrawPath::Impl {
       }
       const std::string samples =
           r.query && query_map ? fmt::format(" samples {}", query_map[r.query - 1]) : std::string();
+      std::string bound;
+      for (uint32_t t : r.textures) {
+        if (t) bound += fmt::format(" {:08X}{}", t & ~1u, (t & 1) ? "R" : "");
+      }
       REXLOG_INFO("tenchuz: NATIVE #{} draw vs {:016X} ps {:016X} prim {} count {} {} ib {:08X}+{:X} vb {:08X}+{:X} "
                   "stride {}{}{}{}; target {}x{} x{}{}, textures {} game {} resolved{}; ndc {:g} {:g} {:g} {:g}, "
-                  "vs constants {:08X}, packet {:08X}, rt {:08X} #{} depth {:08X} #{}",
+                  "vs constants {:08X}, packet {:08X}, rt {:08X} #{} depth {:08X} #{}, bound{}",
                   i, r.vs, r.ps, r.prim, r.count, r.indexed ? "indexed" : "auto", r.ib_base, r.ib_size,
                   r.vb_base, r.vb_size, r.vb_stride, (r.arena & 1) ? " vb-arena" : "",
                   (r.arena & 2) ? " ib-arena" : "", samples, r.target_width, r.target_height, r.samples,
                   r.depth_test ? " depth" : "", r.guest_textures, r.resolved_textures, r.hud ? ", hud" : "",
-                  r.ndc_scale[0], r.ndc_scale[1], r.ndc_offset[0], r.ndc_offset[1], r.vs_constants_hash, r.packet,
-                  r.color_info, r.color_surface, r.depth_info, r.depth_surface);
+                  r.ndc_scale[0], r.ndc_scale[1], r.ndc_offset[0], r.ndc_offset[1],
+                  r.vs_constants ? uint32_t(XXH3_64bits(r.vs_constants, r.vs_constants_size)) : 0u, r.packet,
+                  r.color_info, r.color_surface, r.depth_info, r.depth_surface, bound);
     }
   }
 
@@ -587,6 +627,9 @@ struct DrawPath::Impl {
   std::unordered_map<uint32_t, ComPtr<ID3D12RootSignature>> root_signatures;
   std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
   DrawStats stats;
+  std::unordered_set<uint64_t> logged_fetches;  // --tenchuz_native_log_textures
+  uint32_t draw_textures[6] = {};  // the current draw's bound textures (DrawRecord::textures)
+  uint32_t draw_texture_count = 0;
   uint32_t logged_errors = 0;
 
   bool Initialize(ID3D12Device* d, rex::memory::Memory* memory) {
@@ -837,12 +880,19 @@ struct DrawPath::Impl {
         }
         uploaded_pages[page >> 6] |= 1ull << (page & 63);
         page_hashes[page] = hash;
+        BeforeOverwrite(page, page + 1);
+        page_used_frame[page] = uint32_t(frame_counter);
         std::memcpy(shared_map + offset, guest, kPageSize);
         stats.uploaded_kb += kPageSize >> 10;
       }
       return;
     }
     const int32_t recheck = REXCVAR_GET(tenchuz_native_recheck_pages);
+    // Geometry outside the D3D's command ring changes rarely: copy it once and
+    // again only after the guest writes it (the texture loader's page watch).
+    // Ring pages are rewritten all the time and are copied every frame.
+    const bool watch = recheck == 0 && loader_ready && loader.WatchingWrites() &&
+                       REXCVAR_GET(tenchuz_native_geometry_watch) && !(host && host->InCommandRing(physical));
     while (page < page_end) {
       if (uploaded_pages[page >> 6] & (1ull << (page & 63))) {
         if (recheck > 0) {
@@ -860,7 +910,7 @@ struct DrawPath::Impl {
                           host && host->InCommandRing(offset) ? ", command ring" : "");
             }
             if (recheck >= 2) {
-              std::memcpy(shared_map + offset, guest, kPageSize);
+              std::memcpy(shared_map + offset, guest, kPageSize);  // this frame's own page
               uploaded_hash = hash;
               stats.uploaded_kb += kPageSize >> 10;
             }
@@ -869,8 +919,22 @@ struct DrawPath::Impl {
         ++page;
         continue;
       }
+      // Watched pages copied before and not written since are still current
+      // in the mirror (it persists across frames).
+      auto current = [&](uint32_t p) {
+        const uint32_t copied = page_copy_sequence[p];
+        return watch && copied && !loader.WrittenSince(p << kPageShift, kPageSize, copied - 1);
+      };
+      if (current(page)) {
+        uploaded_pages[page >> 6] |= 1ull << (page & 63);
+        page_used_frame[page] = uint32_t(frame_counter);
+        ++stats.watched_pages;
+        ++page;
+        continue;
+      }
       const uint32_t run_start = page;
-      while (page < page_end && !(uploaded_pages[page >> 6] & (1ull << (page & 63)))) {
+      while (page < page_end && !(uploaded_pages[page >> 6] & (1ull << (page & 63))) &&
+             (page == run_start || !current(page))) {
         uploaded_pages[page >> 6] |= 1ull << (page & 63);
         if (recheck > 0) {
           static_page_hashes[page] = XXH3_64bits(REX_RAW_ADDR(0xA0000000u | (page << kPageShift)), kPageSize);
@@ -879,6 +943,15 @@ struct DrawPath::Impl {
       }
       const uint32_t offset = run_start << kPageShift;
       const uint32_t bytes = (page - run_start) << kPageShift;
+      BeforeOverwrite(run_start, page);
+      std::fill(page_used_frame.begin() + run_start, page_used_frame.begin() + page, uint32_t(frame_counter));
+      if (watch) {
+        // Sequence first, then protect, then copy: a write from here on is
+        // newer than the copy and makes the pages stale.
+        const uint32_t sequence = loader.WriteSequence();
+        loader.Watch(offset, bytes);
+        for (uint32_t p = run_start; p < page; ++p) page_copy_sequence[p] = sequence + 1;
+      }
       std::memcpy(shared_map + offset, REX_RAW_ADDR(0xA0000000u | offset), bytes);
       NoteCopy(base, offset, bytes, 'S');
       stats.uploaded_kb += bytes >> 10;
@@ -1061,7 +1134,11 @@ struct DrawPath::Impl {
     desc.NumRenderTargets = rt_count;
     desc.SampleDesc.Count = target.samples;
     ComPtr<ID3D12PipelineState> pso;
+    const auto pso_start = std::chrono::steady_clock::now();
     const HRESULT hr = CreatePipelineGuarded(device, desc, pso.ReleaseAndGetAddressOf());
+    const double pso_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pso_start).count();
+    ++stats.pipelines_created;
+    stats.pipeline_ms += pso_ms;
     if (FAILED(hr)) {
       if (logged_errors++ < 16) {
         REXLOG_WARN("tenchuz: N4 pipeline creation failed ({:08X}) vs {:016X} ps {:016X}", uint32_t(hr),
@@ -1198,6 +1275,36 @@ struct DrawPath::Impl {
     return gpu;
   }
 
+  // --tenchuz_native_log_textures: each distinct fetch once, with how it was
+  // bound. Native resolves aren't written to guest memory, so a guest texture
+  // overlapping a resolve destination loads stale data there.
+  void LogFetch(const xenos::xe_gpu_texture_fetch_t& fetch, const gfx::DxbcShader::TextureBinding& binding,
+                DrawHost* host, const char* how) {
+    const uint64_t key = XXH3_64bits(&fetch, sizeof(fetch)) ^ (uint64_t(binding.dimension) << 1) ^
+                         uint64_t(binding.is_signed);
+    if (!logged_fetches.insert(key).second) {
+      return;
+    }
+    const uint32_t address = fetch.base_address << 12;
+    const gfx::FormatInfo* info = gfx::FormatInfo::Get(fetch.format);
+    const uint32_t width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
+    const uint32_t pitch = fetch.pitch ? uint32_t(fetch.pitch) << 5 : width;
+    const uint32_t bytes = ((pitch + 31) & ~31u) * ((height + 31) & ~31u) * (info ? info->bits_per_pixel : 32) / 8;
+    std::string overlap = host ? host->ResolveOverlapping(address, std::max(bytes, 1u)) : std::string();
+    if (fetch.mip_address && host && overlap.empty()) {
+      overlap = host->ResolveOverlapping(fetch.mip_address << 12, std::max(bytes / 2, 1u));
+      if (!overlap.empty()) {
+        overlap = "mips " + overlap;
+      }
+    }
+    REXLOG_INFO("tenchuz: NATIVE fetch {:08X} {}x{} fmt {} dim {} (binding dim {}{}) tiled {} pitch {} mips {}-{} "
+                "mip {:08X} swizzle {:03X} -> {}{}{}",
+                address, width, height, int(fetch.format), int(fetch.dimension), int(binding.dimension),
+                binding.is_signed ? " signed" : "", uint32_t(fetch.tiled), pitch, uint32_t(fetch.mip_min_level),
+                uint32_t(fetch.mip_max_level), fetch.mip_address << 12, uint32_t(fetch.swizzle), how,
+                overlap.empty() ? "" : " OVERLAPS RESOLVE ", overlap);
+  }
+
   // Writes an SRV for one shader texture binding at `cpu`: a resolved render
   // target, else a loaded guest texture. False if neither fits the binding,
   // with the reason. Sets the fetch constant's bit in `resolution_scaled` (the
@@ -1227,6 +1334,10 @@ struct DrawPath::Impl {
           resolution_scaled |= 1u << binding.fetch_constant;
         }
         ++stats.textures_resolved;
+        if (draw_texture_count < 6) draw_textures[draw_texture_count++] = (fetch.base_address << 12) | 1;
+        if (REXCVAR_GET(tenchuz_native_log_textures)) {
+          LogFetch(fetch, binding, textures, "resolved");
+        }
         return true;
       }
     }
@@ -1288,6 +1399,10 @@ struct DrawPath::Impl {
     }
     device->CreateShaderResourceView(texture.resource, &view, cpu);
     ++stats.textures_guest;
+    if (draw_texture_count < 6) draw_textures[draw_texture_count++] = fetch.base_address << 12;
+    if (REXCVAR_GET(tenchuz_native_log_textures)) {
+      LogFetch(fetch, binding, textures, "guest");
+    }
     return true;
   }
 
@@ -1565,6 +1680,7 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
                     const DrawShaders& shaders, const DrawTarget& target, DrawHost* host) {
   DrawHost* textures = host;
   Impl& m = *impl_;
+  m.frame_host = host;
   const auto& regs = *reinterpret_cast<const gfx::RegisterFile*>(state.regs);
   if (!shaders.vertex || !target.width || !target.height) {
     ++m.stats.skipped_other;
@@ -1871,9 +1987,15 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
     }
     return true;
   };
-  auto* system = static_cast<Translator::SystemConstants*>(
+  // The system constants are built on the stack and copied to the constant
+  // ring once (before the CBV is bound): the ring is write-combined upload
+  // memory, and the read-modify-writes below cost ~10% of the main thread.
+  auto* system_mapped = static_cast<Translator::SystemConstants*>(
       m.AllocConstants(sizeof(Translator::SystemConstants), system_gpu));
-  if (!fetch || !bool_loop || !system || !pack_floats(&vs_shader, gfx::XE_GPU_REG_SHADER_CONSTANT_000_X, vs_float_gpu) ||
+  Translator::SystemConstants system_cpu;
+  Translator::SystemConstants* const system = &system_cpu;
+  if (!fetch || !bool_loop || !system_mapped ||
+      !pack_floats(&vs_shader, gfx::XE_GPU_REG_SHADER_CONSTANT_000_X, vs_float_gpu) ||
       !pack_floats(ps_shader, gfx::XE_GPU_REG_SHADER_CONSTANT_256_X, ps_float_gpu)) {
     ++m.stats.skipped_other;
     return false;
@@ -1888,6 +2010,7 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   uint32_t resolution_scaled = 0;
   const uint32_t guest_textures_before = m.stats.textures_guest;
   const uint32_t resolved_textures_before = m.stats.textures_resolved;
+  m.draw_texture_count = 0;
   const D3D12_GPU_DESCRIPTOR_HANDLE ps_table =
       ps_shader ? m.TextureTable(*ps_shader, regs, list, textures, base, tables_ok, resolution_scaled)
                 : D3D12_GPU_DESCRIPTOR_HANDLE{};
@@ -1903,7 +2026,11 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   record.samples = target.samples;
   record.guest_textures = m.stats.textures_guest - guest_textures_before;
   record.resolved_textures = m.stats.textures_resolved - resolved_textures_before;
+  for (uint32_t i = 0; i < 6; ++i) {
+    record.textures[i] = i < m.draw_texture_count ? m.draw_textures[i] : 0;
+  }
   record.depth_test = target.depth_format != DXGI_FORMAT_UNKNOWN && NormalizedDepthControl(regs).z_enable;
+  m.stats.depth_draws += record.depth_test;
   // Widescreen: 2D draws on the final target keep 16:9 proportions in the
   // middle of the wider image: the HUD, menus and movies. Their vertices are
   // already in screen pixels (a vertex shader without float constants), they
@@ -1923,7 +2050,8 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   record.ndc_offset[1] = system->ndc_offset[1];
   if (const uint32_t n = vs_shader.constant_register_map().float_count) {
     // The packed VS constants were written just above (pack_floats).
-    record.vs_constants_hash = uint32_t(XXH3_64bits(vs_float_cpu, size_t(16) * n));
+    record.vs_constants = vs_float_cpu;
+    record.vs_constants_size = 16 * n;
   }
   if (m.log_offscreen && !vs_shader.constant_register_map().float_count && record.vb_size &&
       record.vb_stride >= 8) {
@@ -1954,6 +2082,7 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   list->SetGraphicsRootConstantBufferView(kRootFetchConstants, fetch_gpu);
   list->SetGraphicsRootConstantBufferView(kRootFloatConstantsVertex, vs_float_gpu);
   list->SetGraphicsRootConstantBufferView(kRootFloatConstantsPixel, ps_float_gpu);
+  std::memcpy(system_mapped, system, sizeof(*system));
   list->SetGraphicsRootConstantBufferView(kRootSystemConstants, system_gpu);
   list->SetGraphicsRootConstantBufferView(kRootBoolLoopConstants, bool_loop_gpu);
   list->SetGraphicsRootDescriptorTable(kRootSharedMemory, shared_table);

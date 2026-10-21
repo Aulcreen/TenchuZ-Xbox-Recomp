@@ -12,6 +12,7 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 
+#include "frame_rate.h"
 #include "renderer/d3d_trace.h"
 #include "renderer/gpu_observer.h"
 #include "renderer/native_renderer.h"
@@ -76,6 +77,7 @@ REX_HOOK_RAW(sub_8241BF50) {
   tenchuz::d3d_trace::OnSwap(ctx);
   tenchuz::gpu_observer::OnSwap(ctx.r3.u32, base);
   tenchuz::native::OnSwap(base, ctx.r3.u32);
+  tenchuz::frame_rate::OnSwap(base, ctx.r3.u32);
   tenchuz::OnGuestSwap();
   __imp__sub_8241BF50(ctx, base);
 }

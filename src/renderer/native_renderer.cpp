@@ -9,6 +9,8 @@
 
 #include "native_renderer.h"
 
+#include "../png_writer.h"
+
 #include "generated/default/tenchuz_pch.h"
 
 #include <algorithm>
@@ -108,7 +110,6 @@ constexpr uint32_t kDevCopyDestPitch = 0x29A0;      // RB_COPY_DEST_PITCH
 constexpr uint32_t kDevCopyDestInfo = 0x29A4;       // RB_COPY_DEST_INFO (only during Resolve, see OnD3DCall)
 constexpr uint32_t kApiResolve = 0x8241D770;        // D3DDevice_Resolve
 constexpr uint32_t kDevDepthClear = 0x29AC;         // RB_DEPTH_CLEAR
-constexpr uint32_t kDevColorClear = 0x29B0;         // RB_COLOR_CLEAR
 constexpr uint32_t kDevRenderTarget0 = 0x2F90;      // bound D3DSurface* RT0-3 (+4 each)
 constexpr uint32_t kDevDepthStencil = 0x2FA0;       // bound depth-stencil D3DSurface*
 constexpr uint32_t kDevViewport = 0x3060;           // D3DVIEWPORT9 copy: X, Y, Width, Height (dwords)
@@ -116,6 +117,7 @@ constexpr uint32_t kDevViewport = 0x3060;           // D3DVIEWPORT9 copy: X, Y, 
 std::atomic<bool> g_present_native{false};
 std::atomic<uint8_t*> g_base{nullptr};
 uint32_t g_device = 0;
+std::atomic<int> g_last_depth_draws{-1};  // depth-tested draws of the last presented frame
 
 rex::ui::Presenter* g_presenter = nullptr;
 const rex::ui::d3d12::D3D12Provider* g_provider = nullptr;
@@ -187,6 +189,7 @@ struct Surface {
   bool red_blue_swapped = false;  // resolved with RB_COPY_DEST_INFO.copy_dest_swap
   bool unordered_access = false;  // created for converting resolves
   uint64_t resolved_frame = 0;    // native frame of the last resolve into it
+  uint32_t guest_bytes = 0;       // resolve destinations: the guest memory a resolve covers
   uint32_t id = 0;                // creation number (draw list diagnostics)
   uint32_t samples = 1;
   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -204,6 +207,25 @@ std::unordered_map<uint32_t, Surface*> g_latest_texture;
 
 uint64_t TextureKey(uint32_t address, uint32_t width, uint32_t height) {
   return uint64_t(address) | (uint64_t(width & 0x3FFF) << 32) | (uint64_t(height & 0x3FFF) << 46);
+}
+
+// Bytes per pixel of the host formats render targets and resolves use.
+uint32_t BytesPerPixel(DXGI_FORMAT format) {
+  switch (format) {
+    case DXGI_FORMAT_R8_UNORM:
+      return 1;
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R16_FLOAT:
+      return 2;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R32G32_FLOAT:
+      return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+      return 16;
+    default:
+      return 4;
+  }
 }
 
 DXGI_FORMAT ColorFormat(uint32_t xenos_format) {
@@ -407,16 +429,20 @@ FrameSlot& WaitForSlot() {
   return slot;
 }
 
+uint64_t g_previous_frame_fence = 0;  // the last fence signalled before this frame's recording
+
 void BeginRecording() {
   if (g_recording) {
     return;
   }
   FrameSlot& slot = WaitForSlot();
   g_resolve_descriptors_used[g_frame % kFramesInFlight] = 0;
-  // Also let the previous frame finish: draws read vertices from a guest-memory
-  // mirror that is updated in place, and the D3D's ring of dynamic vertices
-  // (2D quads, the frame's final composite) reuses addresses from frame to frame.
-  WaitForFence(g_fence_counter, "previous frame");
+  // The GPU may still be running the previous frame while this one is
+  // recorded. Draws read a guest-memory mirror that is updated in place, so
+  // the draw path waits for that frame (FrameHost::WaitForPreviousFrame) only
+  // before overwriting a page it read. (The D3D's ring of dynamic vertices
+  // goes to per-slot arenas.)
+  g_previous_frame_fence = g_fence_counter;
   slot.retired.clear();
   slot.allocator->Reset();
   g_list->Reset(slot.allocator.Get(), nullptr);
@@ -483,11 +509,17 @@ void FlushPendingClears() {
   g_pending_clear = {};
 }
 
-void UnpackColorClear(uint32_t argb, float out[4]) {
-  out[0] = ((argb >> 16) & 0xFF) / 255.0f;
-  out[1] = ((argb >> 8) & 0xFF) / 255.0f;
-  out[2] = (argb & 0xFF) / 255.0f;
-  out[3] = (argb >> 24) / 255.0f;
+// The clear colour of ClearF / Resolve: the D3DVECTOR4 (r, g, b, a) the game
+// passes, or with none, the D3D fills all four from the constant 0.0f at
+// 0x820024DC: transparent black. (Not RB_COLOR_CLEAR, which keeps the last
+// clear's colour: the blood maps, cleared without a colour, then got alpha 1
+// and blended bloodied characters entirely to black.)
+constexpr uint32_t kNullClearConstant = 0x820024DC;
+
+void ClearColorArgument(uint8_t* base, uint32_t color_ptr, float out[4]) {
+  for (int i = 0; i < 4; ++i) {
+    out[i] = LoadFloat(base, color_ptr ? color_ptr + 4 * i : kNullClearConstant);
+  }
 }
 
 // --- Presentation ------------------------------------------------------------
@@ -987,6 +1019,8 @@ class FrameHost final : public DrawHost {
  public:
   bool InCommandRing(uint32_t address) override { return gpu_observer::InCommandRing(address); }
 
+  void WaitForPreviousFrame() override { WaitForFence(g_previous_frame_fence, "previous frame"); }
+
   void FlushAndWait() override {
     ID3D12CommandQueue* queue = g_provider->GetDirectQueue();
     g_list->Close();
@@ -1040,6 +1074,17 @@ class FrameHost final : public DrawHost {
         break;
     }
     return true;
+  }
+
+  std::string ResolveOverlapping(uint32_t address, uint32_t size) override {
+    for (const auto& [key, s] : g_textures) {
+      const uint32_t dest = uint32_t(key);
+      if (s.guest_bytes && address < dest + s.guest_bytes && dest < address + size) {
+        return fmt::format("{:08X} {}x{} fmt {} ({} bytes, last frame {})", dest, s.width, s.height, int(s.format),
+                           s.guest_bytes, s.resolved_frame);
+      }
+    }
+    return {};
   }
 };
 FrameHost g_frame_host;
@@ -1264,6 +1309,91 @@ void DumpResolvedTextures() {
               dir.string());
 }
 
+// RequestScreenshot: the next presented front buffer, with the display gamma
+// ramp applied, as a PNG. Waits for the GPU (test runs only).
+std::mutex g_screenshot_mutex;
+std::filesystem::path g_screenshot_path;
+
+void SaveScreenshot(Surface& s, const std::filesystem::path& path) {
+  if (!s.resource || (s.format != DXGI_FORMAT_R8G8B8A8_UNORM && s.format != DXGI_FORMAT_B8G8R8A8_UNORM)) {
+    REXLOG_WARN("tenchuz: screenshot {}: front buffer format {} not supported", path.string(), int(s.format));
+    return;
+  }
+  ID3D12CommandQueue* queue = g_provider->GetDirectQueue();
+  auto wait_idle = [&] {
+    const uint64_t value = ++g_fence_counter;
+    queue->Signal(g_fence.Get(), value);
+    WaitForFence(value, "screenshot");
+  };
+  wait_idle();
+  FrameSlot& slot = g_slots[g_frame % kFramesInFlight];
+  slot.allocator->Reset();
+  g_list->Reset(slot.allocator.Get(), nullptr);
+  const D3D12_RESOURCE_DESC desc = s.resource->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  UINT64 total = 0;
+  g_d3d->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+  D3D12_RESOURCE_DESC buffer = {};
+  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer.Width = total;
+  buffer.Height = 1;
+  buffer.DepthOrArraySize = 1;
+  buffer.MipLevels = 1;
+  buffer.SampleDesc.Count = 1;
+  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ComPtr<ID3D12Resource> readback;
+  if (FAILED(g_d3d->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
+                                            &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&readback)))) {
+    g_list->Close();
+    return;
+  }
+  Transition(s, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12_TEXTURE_COPY_LOCATION to = {readback.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+  to.PlacedFootprint = footprint;
+  D3D12_TEXTURE_COPY_LOCATION from = {s.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+  g_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+  g_list->Close();
+  ID3D12CommandList* lists[] = {g_list.Get()};
+  queue->ExecuteCommandLists(1, lists);
+  wait_idle();
+  uint8_t* data = nullptr;
+  const D3D12_RANGE range = {0, SIZE_T(total)};
+  if (FAILED(readback->Map(0, &range, reinterpret_cast<void**>(&data)))) {
+    return;
+  }
+  std::array<uint32_t, 256> ramp;
+  bool use_ramp;
+  {
+    std::lock_guard lock(g_gamma_mutex);
+    ramp = g_gamma_ramp;
+    use_ramp = g_gamma_ramp_set;
+  }
+  const uint32_t width = footprint.Footprint.Width, height = footprint.Footprint.Height;
+  std::vector<uint8_t> pixels(size_t(width) * height * 4);
+  const bool bgra = s.format == DXGI_FORMAT_B8G8R8A8_UNORM;
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint8_t* src = data + size_t(y) * footprint.Footprint.RowPitch;
+    uint8_t* dst = pixels.data() + size_t(y) * width * 4;
+    for (uint32_t x = 0; x < width; ++x) {
+      uint8_t r = src[4 * x], g = src[4 * x + 1], b = src[4 * x + 2];
+      if (bgra) std::swap(r, b);
+      if (use_ramp) {
+        r = uint8_t(((ramp[r] >> 20) & 0x3FF) >> 2);
+        g = uint8_t(((ramp[g] >> 10) & 0x3FF) >> 2);
+        b = uint8_t((ramp[b] & 0x3FF) >> 2);
+      }
+      dst[4 * x] = r, dst[4 * x + 1] = g, dst[4 * x + 2] = b, dst[4 * x + 3] = 255;
+    }
+  }
+  const D3D12_RANGE none = {0, 0};
+  readback->Unmap(0, &none);
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  const bool ok = WritePng(path, width, height, pixels.data(), width * 4);
+  REXLOG_INFO("tenchuz: screenshot frame {} -> {}{}", g_frame, path.string(), ok ? "" : " (failed)");
+}
+
 void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, bool present) {
   ID3D12CommandQueue* queue = g_provider->GetDirectQueue();
   if (g_recording) {
@@ -1292,12 +1422,40 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
     DumpResolvedTextures();
   }
   auto it = g_latest_texture.find(front_buffer);
+  {
+    std::filesystem::path shot;
+    {
+      std::lock_guard lock(g_screenshot_mutex);
+      if (present && it != g_latest_texture.end()) {
+        shot = std::exchange(g_screenshot_path, {});
+      } else if (!g_screenshot_path.empty() && g_frame % 30 == 0) {
+        REXLOG_INFO("tenchuz: screenshot waiting: frame {} {} front buffer {:08X} {}", g_frame,
+                    present ? "present" : "not presented", front_buffer,
+                    it != g_latest_texture.end() ? "native" : "not resolved natively");
+      }
+    }
+    if (!shot.empty()) {
+      SaveScreenshot(*it->second, shot);
+    }
+  }
   if (!g_recording) {
     WaitForSlot();  // the present list reuses this slot's allocator
   }
   LogPresentCheck(g_present_checks[g_frame % kFramesInFlight]);
   const DrawStats draw_stats = g_draw_path ? g_draw_path->TakeFrameStats() : DrawStats{};
+  if (g_draw_path) g_last_depth_draws.store(int(draw_stats.depth_draws), std::memory_order_relaxed);
   const gpu_observer::ResyncStats rs = gpu_observer::TakeResyncStats();
+  {
+    // Frames slowed by new shaders: translation and pipeline creation.
+    static double translated_before = 0;
+    const double translated = g_shaders ? g_shaders->stats().translate_ms : 0;
+    const double translate_ms = translated - translated_before;
+    translated_before = translated;
+    if (translate_ms + draw_stats.pipeline_ms >= 4.0) {
+      REXLOG_INFO("tenchuz: NATIVE frame {}: {:.1f} ms translating shaders, {} pipelines in {:.1f} ms", g_frame,
+                  translate_ms, draw_stats.pipelines_created, draw_stats.pipeline_ms);
+    }
+  }
   if (draw_stats.stale_pages) {  // --tenchuz_native_recheck_pages
     REXLOG_INFO("tenchuz: NATIVE frame {}: {} static pages changed after their upload", g_frame,
                 draw_stats.stale_pages);
@@ -1314,12 +1472,13 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
                 g_frame_draws, g_frame_draws_ready, st.unique_shaders, st.translations, st.failures,
                 st.copy_mode_draws);
     REXLOG_INFO("tenchuz: NATIVE issued {} draws ({} to several targets, {} with stencil, {} kept at 16:9); skipped "
-                "{} primitive type (types mask {:X}), {} pipeline, {} culled, {} other; uploaded {} KB, {} KB per draw "
-                "(dynamic); {} reset indices converted",
+                "{} primitive type (types mask {:X}), {} pipeline, {} culled, {} other; uploaded {} KB ({} unchanged pages "
+                "kept), {} KB per draw (dynamic); {} reset indices converted; {} waits for the previous frame",
                 draw_stats.issued, draw_stats.mrt_draws, draw_stats.stencil_draws, draw_stats.hud_draws,
                 draw_stats.skipped_primitive,
                 draw_stats.skipped_primitive_types, draw_stats.skipped_pipeline, draw_stats.skipped_culled,
-                draw_stats.skipped_other, draw_stats.uploaded_kb, draw_stats.arena_kb, draw_stats.reset_converted);
+                draw_stats.skipped_other, draw_stats.uploaded_kb, draw_stats.watched_pages, draw_stats.arena_kb,
+                draw_stats.reset_converted, draw_stats.previous_frame_waits);
     REXLOG_INFO("tenchuz: NATIVE decode: {} kicks, {} segment switches, {} gap ({} KB), {} backward, {} stuck "
                 "({} resumed)",
                 rs.kicks, rs.segment, rs.gap, rs.gap_kb, rs.backward, rs.stuck, rs.resumed);
@@ -1627,6 +1786,11 @@ bool PresentNative() {
   return g_present_native.load(std::memory_order_relaxed);
 }
 
+void RequestScreenshot(const std::filesystem::path& path) {
+  std::lock_guard lock(g_screenshot_mutex);
+  g_screenshot_path = path;
+}
+
 void RequestFrameDump() {
   g_dump_requested.store(true);
 }
@@ -1656,6 +1820,8 @@ void TogglePresentNative() {
   }
 }
 
+int LastFrameDepthDraws() { return Active() ? g_last_depth_draws.load(std::memory_order_relaxed) : -1; }
+
 void OnSwap(uint8_t* base, uint32_t device) {
   g_base.store(base, std::memory_order_relaxed);
   g_device = device;
@@ -1675,7 +1841,7 @@ void DumpObject(uint8_t* base, const char* what, uint32_t address) {
   REXLOG_INFO("tenchuz: NATIVE {} {:08X}: {}", what, address, words);
 }
 
-void OnClear(uint8_t* base, uint32_t flags, uint32_t color_ptr, double z, uint32_t stencil) {
+void OnClear(uint8_t* base, uint32_t flags, uint32_t color_ptr, double z, uint32_t stencil, uint32_t caller) {
   if (!Active() || !g_device) {
     return;
   }
@@ -1690,21 +1856,17 @@ void OnClear(uint8_t* base, uint32_t flags, uint32_t color_ptr, double z, uint32
   }
   if (flags & 0xF) {
     float color[4];
-    if (color_ptr) {
-      for (int i = 0; i < 4; ++i) {
-        color[i] = LoadFloat(base, color_ptr + 4 * i);
-      }
-    } else {
-      UnpackColorClear(Dev(base, kDevColorClear), color);
-    }
+    ClearColorArgument(base, color_ptr, color);
     for (uint32_t rt = 0; rt < 4; ++rt) {
       if ((flags & (1u << rt)) && Dev(base, kDevRenderTarget0 + 4 * rt)) {
         if (Surface* s = ColorTarget(base, rt)) {
           ClearColor(*s, color);
           if (Logging()) {
-            REXLOG_INFO("tenchuz: NATIVE clear RT{} edram {:03X} {}x{} fmt {} color ({:.2f},{:.2f},{:.2f},{:.2f})",
+            REXLOG_INFO("tenchuz: NATIVE clear RT{} edram {:03X} {}x{} fmt {} color ({:.2f},{:.2f},{:.2f},{:.2f}) "
+                        "from {:08X} (colour at {:08X}, flags {:X})",
                         rt, (rt == 0 ? Dev(base, kDevColorInfo) : Dev(base, kDevColor1Info + 4 * (rt - 1))) & 0xFFF,
-                        s->width, s->height, int(s->format), color[0], color[1], color[2], color[3]);
+                        s->width, s->height, int(s->format), color[0], color[1], color[2], color[3], caller,
+                        color_ptr, flags);
           }
         }
       }
@@ -1873,6 +2035,7 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
   g_latest_texture[dest] = &dst;
   dst.red_blue_swapped = false;
   dst.resolved_frame = g_frame;
+  dst.guest_bytes = ((src->width + 31) & ~31u) * ((src->height + 31) & ~31u) * 4;
   ++g_frame_resolves;
   const uint32_t op = BeginOp("resolve depth", dest, (src->width << 16) | src->height);
   bool done = true;
@@ -1925,13 +2088,7 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
   if (flags & 0x100) {
     if (Surface* s = ColorTarget(base, source_select < 4 ? source_select : 0)) {
       g_pending_clear.color = s;
-      if (clear_color_ptr) {
-        for (int i = 0; i < 4; ++i) {
-          g_pending_clear.rgba[i] = LoadFloat(base, clear_color_ptr + 4 * i);
-        }
-      } else {
-        UnpackColorClear(Dev(base, kDevColorClear), g_pending_clear.rgba);
-      }
+      ClearColorArgument(base, clear_color_ptr, g_pending_clear.rgba);
     }
   }
   if (flags & 0x200) {
@@ -1988,6 +2145,7 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
   g_latest_texture[dest] = &dst;
   g_resolve_sources[dest] = src;
   dst.resolved_frame = g_frame;
+  dst.guest_bytes = ((dest_width + 31) & ~31u) * ((dest_height + 31) & ~31u) * BytesPerPixel(dest_format);
   ++g_frame_resolves;
   dst.red_blue_swapped = (dest_info >> 24) & 1;
   const uint32_t op = BeginOp("resolve copy", dest, (dest_width << 16) | dest_height);
@@ -2048,8 +2206,9 @@ REX_HOOK_RAW(sub_8241B308) {
   const uint32_t color_ptr = ctx.r6.u32;
   const double z = ctx.f1.f64;
   const uint32_t stencil = ctx.r7.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
   __imp__sub_8241B308(ctx, base);
-  tenchuz::native::OnClear(base, flags, color_ptr, z, stencil);
+  tenchuz::native::OnClear(base, flags, color_ptr, z, stencil, caller);
 }
 
 REX_EXTERN(__imp__sub_8242A4F8);

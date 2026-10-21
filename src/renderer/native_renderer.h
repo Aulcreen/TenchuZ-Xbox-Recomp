@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include <cstdint>
 
 namespace rex {
@@ -30,7 +32,14 @@ void TogglePresentNative();
 // Writes the resolved images of the next native frame to logs/frame_dumps.
 void RequestFrameDump();
 
+// Saves the next presented frame (display gamma applied) as a PNG.
+void RequestScreenshot(const std::filesystem::path& path);
+
 // Called from the D3D Swap hook before the original Swap runs (r3 = device).
 void OnSwap(uint8_t* base, uint32_t device);
+
+// Depth-tested draws in the last presented frame (a 3D scene if nonzero), or
+// -1 when the native renderer isn't drawing.
+int LastFrameDepthDraws();
 
 }  // namespace tenchuz::native

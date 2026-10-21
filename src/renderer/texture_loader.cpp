@@ -1191,6 +1191,15 @@ TextureLoader::Result TextureLoader::Get(ID3D12GraphicsCommandList* list, const 
   return impl_->Get(list, fetch, base, upload, out);
 }
 
+bool TextureLoader::WatchingWrites() const { return impl_->memory != nullptr; }
+uint32_t TextureLoader::WriteSequence() const { return impl_->write_sequence.load(std::memory_order_relaxed); }
+bool TextureLoader::WrittenSince(uint32_t physical, uint32_t size, uint32_t sequence) const {
+  return impl_->WrittenSince(physical, size, sequence);
+}
+void TextureLoader::Watch(uint32_t physical, uint32_t size) {
+  if (impl_->memory) impl_->Watch(physical, size);
+}
+
 TextureLoader::Stats TextureLoader::TakeFrameStats() {
   Stats s = impl_->stats;
   s.textures = uint32_t(impl_->entries.size());

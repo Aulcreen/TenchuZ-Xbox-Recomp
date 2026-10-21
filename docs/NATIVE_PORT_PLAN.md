@@ -457,6 +457,26 @@ with a few fixed-step candidates to test at 60 fps.
       - The ultrawide image is anamorphic. Rendering targets wider than the game's 1280 needs
         the game's 2D and post passes to cope, and is not done.
 
+- **Fixed (2026-10-21), from the first player reports:**
+  - **Bloodied characters rendered black.** Each fighting character's blood map is a 256×256
+    target cleared, given blood splats (sprites of `1E260000`) and resolved every frame
+    (`1DE82000`, `1DE42000`, `1DE02000`, `1DDC2000`). Once a character is bloodied, its pixel
+    shader (`103B8981`) blends the clothes towards the map's colour by the map's alpha. The clear
+    passes no colour, and the D3D's `ClearF` and `Resolve` then use `0.0f` from `0x820024DC` for
+    all four components (transparent black). We had used `RB_COLOR_CLEAR`, which still held the
+    last clear's opaque black, so alpha was 1 everywhere and the whole character turned black.
+    The water reflection target (`194A5000`) is cleared the same way, so its alpha depended on
+    whatever clear came before.
+  - **CPU and GPU now overlap.** Recording a frame no longer waits for the previous one to finish
+    on the GPU. The draw path tracks which frame last read each 4 KB page of the guest-memory
+    mirror, and waits only before overwriting a page the previous frame read (none in a Mission 1
+    run). Uncapped, the village went from about 75 to 185 fps.
+  - Diagnostics added: `--tenchuz_native_log_textures` (each distinct texture fetch once, flagging
+    guest textures that overlap a resolve destination), bound texture addresses in the draw list,
+    the caller and colour source of each logged clear, and the time spent translating shaders and
+    creating pipelines in slow frames. Test runs drive the game with `--tenchuz_input_script`
+    (`src/input/pc_input.h`) and save their own screenshots, without window focus.
+
 ### Track A: native audio (low priority: audio already works)
 - **A1** Map XACT/XAudio usage: which voices take XMA from the `.xwb` banks.
 - **A2** Decode XMA at the voice level (or pre-convert banks to PCM/Opus at install) and drop the

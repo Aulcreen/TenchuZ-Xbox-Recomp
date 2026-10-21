@@ -14,11 +14,19 @@ include(generated/rexglue.cmake)
 set(TENCHUZ_SOURCES
     src/main.cpp
     src/crash_report.cpp
+    src/debug_tools.cpp
+    src/frame_rate.cpp
     src/frame_stats.cpp
+    src/input/pc_input.cpp
     src/profile_fix.cpp
+    src/profiler.cpp
+    src/sdk_fixes.cpp
+    src/ui/audio_volume.cpp
+    src/ui/game_menu.cpp
     src/widescreen.cpp
     src/net/system_link.cpp
     src/net/transport_local.cpp
+    src/png_writer.cpp
     src/renderer/d3d_trace.cpp
     src/renderer/d3d_trace_hooks.gen.cpp
     src/renderer/draw_path.cpp
@@ -38,7 +46,16 @@ endif()
 
 rexglue_setup_target(tenchuz GPU_PLUGINS xenos)
 if(WIN32)
-    target_link_libraries(tenchuz PRIVATE ws2_32)
+    target_link_libraries(tenchuz PRIVATE ws2_32 dbghelp winmm synchronization windowscodecs ole32)
+endif()
+
+# Setup.exe: the installer stub. tools/package_release.ps1 appends the game
+# files to it (TenchuZ-Setup-<version>.exe), which installs them and copies the
+# player's own disc image into game\ (src/setup/setup_main.cpp).
+if(WIN32)
+    add_executable(tenchuz_setup src/setup/setup_main.cpp)
+    set_target_properties(tenchuz_setup PROPERTIES OUTPUT_NAME "Setup")
+    target_link_libraries(tenchuz_setup PRIVATE bcrypt cabinet ole32 shell32 uuid)
 endif()
 
 # System Link over Steam, when the Steamworks SDK (the zip's sdk folder) is in

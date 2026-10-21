@@ -34,16 +34,24 @@ The goal is a native Windows (later Linux) executable built by statically recomp
 - [ ] Audio: XACT banks play (XMA decode through the SDK)
 - [ ] FMV: the `.wmv` cutscenes play correctly (the software decoder lives in the XEX). The intro movie already renders.
 - [ ] Saves: XContent / save device redirected to a host folder
-- [ ] Input: XInput gamepad, then keyboard and mouse (see AC6_recomp's `ac6_kbm_input.cpp`)
+- [x] Input: XInput gamepad, keyboard and mouse (`src/input/pc_input.cpp`: rebindable keys and
+      mouse buttons, mouse camera scaled by frame time, a walk key). Esc > Controls > Input picks
+      the device: Auto (a connected controller, else keyboard and mouse), keyboard, or controller
 - [ ] Fix the GPU `Resolve region is empty` / `PM4_DRAW_INDX_2 Failed in backend` pair. It's identical
       to the 2023 Xenia log, about 3,000 per 8 minutes in menus and missions, and has no obvious visual impact so far
 - [ ] Play through all stages and log every issue in `docs/ISSUES.md`
 
 ## Phase 3: PC enhancements
 - [ ] Resolution and aspect ratio: widescreen FOV and HUD hooks
-- [ ] Frame rate: find the game-tick and delta-time logic and decouple it from 30 fps
-- [ ] Settings UI (ImGui overlay from the SDK), config file, and launcher
-- [ ] Optimization flags (`cr_as_local`, `non_volatile_as_local`, …) once the build is stable
+- [x] Frame rate: 60 fps in 3D scenes (up to 240 by choice); 2D screens and the pause menu,
+      which animate per frame, stay at 30 (`docs/FRAME_RATE.md`)
+- [x] Settings: the Esc game menu (`src/ui/game_menu.cpp`), saved to `tenchuz.toml`; pauses the game
+- [x] Optimization: renderer per-draw costs cut (no per-draw constant hashing, geometry copied only
+      when the game writes it, constants built off write-combined memory, GPU waits sleep); CPU
+      and GPU frames overlap; the SDK timer thread no longer spins a core; 1 ms timer resolution.
+      Mission 1 runs 80-120 fps uncapped. Next lever: the game's D3DX mesh tests
+      (`sub_82441DB8`) natively. The register-local codegen options stay off (hangs and broken
+      movies, see `config/default.toml`). Profiler: F7.
 - [ ] Linux (Vulkan) build
 - [ ] Multiplayer: System Link over a virtual LAN, over Steam lobbies and P2P (App ID 480) or
       loopback between local instances (`docs/MULTIPLAYER.md`). Local co-op works up to a
@@ -51,7 +59,10 @@ The goal is a native Windows (later Linux) executable built by statically recomp
       is untested (needs two PCs). Xbox LIVE modes are not covered.
 
 ## Phase 4: Distribution
-- [ ] Installer flow: user points at their ISO, then we extract it and verify the XEX hash
+- [x] Installer: `tools/package_release.ps1` builds one `TenchuZ-Setup-<version>.exe` (Setup.exe
+      with the exe, DLLs and VC++ runtime appended, LZMS). It requires the player's ISO, checks its
+      `default.xex` (SHA-256) before installing anything, copies the disc into `game\` and makes
+      shortcuts; the installed game doesn't need the ISO
 - [ ] Release CI that ships the EXE only, never game data
 
 ## Reverse-engineering backlog

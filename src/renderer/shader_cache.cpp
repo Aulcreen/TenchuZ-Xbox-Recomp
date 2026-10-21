@@ -16,6 +16,8 @@
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+
+#include <chrono>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/hash.h>
@@ -100,7 +102,10 @@ struct ShaderCache::Impl {
     gfx::Shader::Translation* translation = shader.GetOrCreateTranslation(modification, &is_new);
     if (is_new) {
       ++stats.translations;
-      if (!translator.TranslateAnalyzedShader(*translation)) {
+      const auto start = std::chrono::steady_clock::now();
+      const bool ok = translator.TranslateAnalyzedShader(*translation);
+      stats.translate_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      if (!ok) {
         ++stats.failures;
         if (logged_failures++ < 16) {
           REXLOG_WARN("tenchuz: N4 {} shader {:016X} modification {:016X} failed to translate",

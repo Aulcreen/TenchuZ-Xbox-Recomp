@@ -10,6 +10,8 @@
 
 #include "generated/default/tenchuz_pch.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
+#include <rex/hook.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -38,6 +41,9 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/windowed_app_context.h>
 
+REXCVAR_DEFINE_BOOL(tenchuz_gpu_wait_sleep, true, "tenchuz",
+                    "Without GPU emulation, the D3D's GPU waits sleep until the command processor makes "
+                    "progress instead of spinning a core");
 REXCVAR_DEFINE_BOOL(tenchuz_native_gpu, true, "tenchuz",
                     "Run without GPU emulation: the native renderer draws, and a native command processor "
                     "executes only what the game observes (fences, interrupts, waits). false: the Xenos GPU "
@@ -45,6 +51,17 @@ REXCVAR_DEFINE_BOOL(tenchuz_native_gpu, true, "tenchuz",
 
 namespace tenchuz::native {
 namespace {
+
+// Bumped whenever the GPU side makes progress the game can poll for: the ring
+// read pointer, fence and memory writes, vblanks. The D3D's GPU waits sleep on
+// it instead of spinning (the sub_82425790 hook below).
+std::atomic<uint32_t> g_progress{0};
+std::atomic<double> g_vblank_hz{0.0};  // SetVblankRate
+
+void Progress() {
+  g_progress.fetch_add(1, std::memory_order_release);
+  WakeByAddressAll(&g_progress);
+}
 
 namespace gfx = rex::graphics;
 namespace xenos = rex::graphics::xenos;
@@ -110,19 +127,43 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         new rex::system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
           rex::system::X_VIDEO_MODE video_mode;
           rex::kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-          const double refresh_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-          const uint64_t interval = std::max<uint64_t>(
-              1, uint64_t(double(rex::chrono::Clock::guest_tick_frequency()) / refresh_hz));
+          const double mode_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+          double hz = -1;  // forces the first computation
+          uint64_t interval = 1;
           uint64_t last = rex::chrono::Clock::QueryGuestTickCount();
+          // Waits until each vblank on a high-resolution timer: Sleep(1)
+          // sleeps a whole 15.6 ms scheduler tick at the default timer
+          // resolution, which bunched vblanks and capped frames near 64/s.
+          HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                TIMER_ALL_ACCESS);
+          const double ticks_per_100ns = double(rex::chrono::Clock::guest_tick_frequency()) / 1e7;
           while (running_) {
             const uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
+            const double want = g_vblank_hz.load(std::memory_order_relaxed);
+            if (want != hz) {  // a new rate starts from now, without a burst of catch-up vblanks
+              hz = want;
+              interval = std::max<uint64_t>(
+                  1, uint64_t(double(rex::chrono::Clock::guest_tick_frequency()) / (hz > 0 ? hz : mode_hz)));
+              last = std::max(last, now - std::min(now - last, interval));
+            }
             while (now - last >= interval) {
               ++counter_;  // the "GPU vblank counter" EVENT_WRITE_SHD can write
               DispatchInterrupt(0, 2);
+              Progress();
               last += interval;
             }
-            rex::thread::Sleep(std::chrono::milliseconds(1));
+            // Until the next vblank, at most 2 ms (rate changes, shutdown).
+            const uint64_t until = last + interval - std::min(last + interval, rex::chrono::Clock::QueryGuestTickCount());
+            const LONGLONG wait_100ns = std::clamp<LONGLONG>(LONGLONG(double(until) / ticks_per_100ns), 1, 20000);
+            LARGE_INTEGER due;
+            due.QuadPart = -wait_100ns;
+            if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+              WaitForSingleObject(timer, INFINITE);
+            } else {
+              rex::thread::Sleep(std::chrono::milliseconds(1));
+            }
           }
+          if (timer) CloseHandle(timer);
           return 0;
         }));
     vsync_thread_->set_name("GPU VSync (native)");
@@ -262,6 +303,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         rex::memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                               read_ptr_index_);
       }
+      Progress();
     }
   }
 
@@ -328,6 +370,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   void StoreGuest(uint32_t address, uint32_t value) {
     value = xenos::GpuSwap(value, xenos::Endian(address & 3));
     rex::memory::store(memory_->TranslatePhysical(address & ~3u), value);
+    Progress();
   }
 
   bool ExecutePacket(RingBuffer* reader) {
@@ -605,8 +648,25 @@ bool NativeGpu() {
   return REXCVAR_GET(tenchuz_native_gpu);
 }
 
+void SetVblankRate(double hz) { g_vblank_hz.store(hz, std::memory_order_relaxed); }
+
 std::unique_ptr<rex::system::IGraphicsSystem> CreateNativeGraphicsSystem() {
   return std::make_unique<NativeGraphicsSystem>();
 }
 
 }  // namespace tenchuz::native
+
+// One step of the D3D's GPU-wait loops (sub_824267D0 and others call it until
+// the read pointer or a fence gets there; nonzero: keep waiting). On the
+// console it spins on yield hints; here that held a host core at 100% for the
+// rest of every frame. Without GPU emulation, sleep until the command
+// processor makes progress instead (1 ms at most, in case the condition comes
+// from somewhere else).
+REX_EXTERN(__imp__sub_82425790);
+REX_HOOK_RAW(sub_82425790) {
+  const uint32_t seen = tenchuz::native::g_progress.load(std::memory_order_acquire);
+  __imp__sub_82425790(ctx, base);
+  if (ctx.r3.u32 && tenchuz::native::NativeGpu() && REXCVAR_GET(tenchuz_gpu_wait_sleep)) {
+    WaitOnAddress(&tenchuz::native::g_progress, const_cast<uint32_t*>(&seen), sizeof(seen), 1);
+  }
+}

@@ -23,3 +23,6 @@ logs/
 
 # Python bytecode
 __pycache__/
+
+# Release packages (tools/package_release.ps1)
+dist/

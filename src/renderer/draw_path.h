@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include <rex/ui/d3d12/d3d12_api.h>
 
@@ -73,6 +74,15 @@ class DrawHost {
   // continues recording on the same list.
   virtual void FlushAndWait() = 0;
 
+  // Waits until the GPU has finished the previous frame (frames overlap: the
+  // CPU records one while the GPU runs the one before). Before a page of the
+  // guest-memory mirror that frame read is overwritten.
+  virtual void WaitForPreviousFrame() = 0;
+
+  // Diagnostics (--tenchuz_native_log_textures): the resolve destination whose
+  // guest memory overlaps [address, address + size), described, or empty.
+  virtual std::string ResolveOverlapping(uint32_t address, uint32_t size) = 0;
+
  protected:
   ~DrawHost() = default;
 };
@@ -98,6 +108,11 @@ struct DrawStats {
   uint32_t mrt_draws = 0;          // draws writing more than one colour target
   uint32_t stencil_draws = 0;      // draws with the stencil test on
   uint32_t hud_draws = 0;          // 2D draws kept at 16:9 (DrawTarget::hud_scale_x)
+  uint32_t depth_draws = 0;        // draws with the depth test on: the frame shows a 3D scene
+  uint32_t watched_pages = 0;      // geometry pages still current from an earlier copy (not copied)
+  uint32_t previous_frame_waits = 0;
+  uint32_t pipelines_created = 0;  // new pipeline state objects this frame
+  double pipeline_ms = 0;          // time spent creating them  // mirror pages rewritten while the previous frame could still read them
   uint32_t skipped_other = 0;
   uint32_t uploaded_kb = 0;
   uint32_t arena_kb = 0;          // dynamic vertices and indices copied per draw
