@@ -16,6 +16,7 @@
 #include "frame_rate.h"
 #include "frame_stats.h"
 #include "input/pc_input.h"
+#include "net/transport.h"
 #include "profiler.h"
 #include "renderer/d3d_trace.h"
 #include "sdk_fixes.h"
@@ -24,6 +25,12 @@
 #include "renderer/native_gpu.h"
 #include "renderer/native_renderer.h"
 #include "widescreen.h"
+
+#include <cstdlib>
+
+#if defined(__APPLE__)
+#include <SDL3/SDL_hints.h>
+#endif
 
 class TenchuzApp : public rex::ReXApp {
  public:
@@ -38,6 +45,21 @@ class TenchuzApp : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override {
     tenchuz::frame_rate::Initialize();
     tenchuz::sdk_fixes::Apply();
+#if defined(__APPLE__)
+    // SDL's GameController-framework (MFi) backend claims Bluetooth pads such
+    // as the 8BitDo Ultimate 2C and then never reports them, which also keeps
+    // SDL's own HIDAPI and IOKit backends off them. Those cover Xbox,
+    // PlayStation, Switch and 8BitDo pads; SDL_JOYSTICK_MFI=1 brings MFi back.
+    // A hint, not setenv: SDL copied the environment when the window opened.
+    if (!std::getenv("SDL_JOYSTICK_MFI")) SDL_SetHint(SDL_HINT_JOYSTICK_MFI, "0");
+    // SteamAPI_InitEx() lists the controllers Steam Input takes in
+    // SDL_GAMECONTROLLER_IGNORE_DEVICES, for its virtual controller to stand
+    // in for them. Steam has no virtual controller on macOS, so the list only
+    // hides them: SDL keeps reading the real ones.
+    SDL_SetHintWithPriority(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES, "", SDL_HINT_OVERRIDE);
+#endif
+    // Steam before SDL opens the controllers (net/transport_steam.cpp).
+    tenchuz::net::StartNetwork();
     // No GPU emulation by default (renderer/native_gpu.h). With
     // --tenchuz_native_gpu=false, Xenos GPU emulation (staged next to the exe
     // by GPU_PLUGINS in CMakeLists); --gpu_plugin still takes precedence there.
@@ -51,6 +73,33 @@ class TenchuzApp : public rex::ReXApp {
   }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
+#if defined(__APPLE__)
+    // The app bundle stays as built: game files ("Set Up Game Files" on the
+    // disk image extracts them, tools/macos), saves, settings and logs are in
+    // ~/Library/Application Support/TenchuZ.
+    const auto support = SupportFolder();
+    std::error_code error;
+    std::filesystem::create_directories(support / "logs", error);
+    if (paths.game_data_root.empty()) {
+      const auto installed = support / "game";
+      if (!std::filesystem::is_directory(installed)) {
+        rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
+                                  "Tenchu Z's game files aren't set up yet.\n\nOpen \"Set Up Game Files\" on the "
+                                  "Tenchu Z disk image and choose your Tenchu Z disc image.");
+        std::exit(1);
+      }
+      paths.game_data_root = installed;
+    }
+    const auto default_user = rex::filesystem::GetUserFolder() / GetName();
+    if (paths.user_data_root == default_user) {
+      const bool default_cache = paths.cache_root == default_user / "cache";
+      paths.user_data_root = support / "user";
+      if (default_cache) {
+        paths.cache_root = paths.user_data_root / "cache";
+      }
+    }
+    paths.config_path = support / "tenchuz.toml";
+#else
     // An installed copy (tools/package_release.ps1) keeps the game data that
     // Setup.exe extracted in game\ next to tenchuz.exe.
     if (paths.game_data_root.empty()) {
@@ -76,11 +125,17 @@ class TenchuzApp : public rex::ReXApp {
         paths.cache_root = paths.user_data_root / "cache";
       }
     }
+#endif
+    settings_path_ = paths.config_path;
     tenchuz::d3d_trace::SetOutputDir(paths.user_data_root / "traces");
     tenchuz::gpu_observer::SetOutputDir(paths.user_data_root / "traces");
     tenchuz::profiler::SetOutputDir(paths.user_data_root / "traces");
     tenchuz::debug_tools::SetOutputDir(paths.user_data_root / "traces");
   }
+
+#if defined(__APPLE__)
+  void OnConfigureLogging(rex::LogConfig& config) override { config.log_dir = SupportFolder() / "logs"; }
+#endif
 
   void OnPostSetup() override {
     // Installed last so no runtime component replaces the top-level filter.
@@ -93,7 +148,7 @@ class TenchuzApp : public rex::ReXApp {
     rex::ui::RegisterBind("bind_gpu_observe", "F9", "Record GPU state at every draw of a frame",
                           [] { tenchuz::gpu_observer::RequestObserve(); });
     tenchuz::native::Initialize(runtime());
-    tenchuz::input::Initialize(window());
+    tenchuz::input::Initialize(window(), runtime()->input_system());
     rex::ui::RegisterBind("bind_native_output", "F10", "Toggle native renderer output",
                           [] { tenchuz::native::TogglePresentNative(); });
     rex::ui::RegisterBind("bind_native_dump", "F11", "Dump the native renderer's resolved images",
@@ -118,7 +173,7 @@ class TenchuzApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     // Esc: the game menu. Its settings go to tenchuz.toml next to the exe,
     // which the SDK loads at startup (command-line flags still win).
-    tenchuz::game_menu::Install(drawer, window(), rex::filesystem::GetExecutableFolder() / "tenchuz.toml");
+    tenchuz::game_menu::Install(drawer, window(), settings_path_);
   }
 
   // Override virtual hooks for customization:
@@ -132,4 +187,15 @@ class TenchuzApp : public rex::ReXApp {
     tenchuz::game_menu::Uninstall();
     tenchuz::input::Shutdown();
   }
+
+ private:
+#if defined(__APPLE__)
+  static std::filesystem::path SupportFolder() {
+    const char* home = std::getenv("HOME");
+    return std::filesystem::path(home ? home : "/tmp") / "Library" / "Application Support" / "TenchuZ";
+  }
+#endif
+
+  // tenchuz.toml: settings the SDK loads at startup and the game menu saves.
+  std::filesystem::path settings_path_;
 };

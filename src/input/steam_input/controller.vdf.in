@@ -1,0 +1,353 @@
+"controller_mappings"
+{
+	"version"		"3"
+	"revision"		"1"
+	"title"		"#title"
+	"description"		"#description"
+	"controller_type"		"@TENCHUZ_CONTROLLER_TYPE@"
+	"major_revision"		"0"
+	"minor_revision"		"0"
+	"Timestamp"		"0"
+	"actions"
+	{
+		"gameplay"
+		{
+			"title"		"#set_gameplay"
+			"legacy_set"		"0"
+			"StickPadGyro"
+			{
+				"left_stick"
+				{
+					"title"		"#left_stick"
+					"input_mode"		"joystick_move"
+				}
+				"right_stick"
+				{
+					"title"		"#right_stick"
+					"input_mode"		"joystick_move"
+				}
+			}
+			"AnalogTrigger"
+			{
+				"left_trigger"		"#left_trigger"
+				"right_trigger"		"#right_trigger"
+			}
+			"Button"
+			{
+				"a"		"#a"
+				"b"		"#b"
+				"x"		"#x"
+				"y"		"#y"
+				"lb"		"#lb"
+				"rb"		"#rb"
+				"ls"		"#ls"
+				"rs"		"#rs"
+				"start"		"#start"
+				"back"		"#back"
+				"dpad_up"		"#dpad_up"
+				"dpad_down"		"#dpad_down"
+				"dpad_left"		"#dpad_left"
+				"dpad_right"		"#dpad_right"
+			}
+		}
+	}
+	"localization"
+	{
+		"english"
+		{
+			"title"		"Tenchu Z"
+			"description"		"Xbox 360 controller layout"
+			"set_gameplay"		"Gameplay"
+			"left_stick"		"Left stick"
+			"right_stick"		"Right stick"
+			"left_trigger"		"LT"
+			"right_trigger"		"RT"
+			"a"		"A"
+			"b"		"B"
+			"x"		"X"
+			"y"		"Y"
+			"lb"		"LB"
+			"rb"		"RB"
+			"ls"		"Left stick click"
+			"rs"		"Right stick click"
+			"start"		"Start"
+			"back"		"Back"
+			"dpad_up"		"D-pad up"
+			"dpad_down"		"D-pad down"
+			"dpad_left"		"D-pad left"
+			"dpad_right"		"D-pad right"
+		}
+	}
+	"group"
+	{
+		"id"		"0"
+		"mode"		"four_buttons"
+		"inputs"
+		{
+			"button_a"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay a"
+						}
+					}
+				}
+			}
+			"button_b"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay b"
+						}
+					}
+				}
+			}
+			"button_x"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay x"
+						}
+					}
+				}
+			}
+			"button_y"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay y"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"1"
+		"mode"		"dpad"
+		"inputs"
+		{
+			"dpad_north"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay dpad_up"
+						}
+					}
+				}
+			}
+			"dpad_south"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay dpad_down"
+						}
+					}
+				}
+			}
+			"dpad_east"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay dpad_right"
+						}
+					}
+				}
+			}
+			"dpad_west"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay dpad_left"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"2"
+		"mode"		"joystick_move"
+		"inputs"
+		{
+			"click"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay ls"
+						}
+					}
+				}
+			}
+		}
+		"gameactions"
+		{
+			"gameplay"		"left_stick"
+		}
+	}
+	"group"
+	{
+		"id"		"3"
+		"mode"		"joystick_move"
+		"inputs"
+		{
+			"click"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay rs"
+						}
+					}
+				}
+			}
+		}
+		"gameactions"
+		{
+			"gameplay"		"right_stick"
+		}
+	}
+	"group"
+	{
+		"id"		"4"
+		"mode"		"trigger"
+		"inputs"
+		{
+		}
+		"gameactions"
+		{
+			"gameplay"		"left_trigger"
+		}
+	}
+	"group"
+	{
+		"id"		"5"
+		"mode"		"trigger"
+		"inputs"
+		{
+		}
+		"gameactions"
+		{
+			"gameplay"		"right_trigger"
+		}
+	}
+	"group"
+	{
+		"id"		"6"
+		"mode"		"switches"
+		"inputs"
+		{
+			"button_escape"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay start"
+						}
+					}
+				}
+			}
+			"button_menu"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay back"
+						}
+					}
+				}
+			}
+			"left_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay lb"
+						}
+					}
+				}
+			}
+			"right_bumper"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"game_action gameplay rb"
+						}
+					}
+				}
+			}
+		}
+	}
+	"preset"
+	{
+		"id"		"0"
+		"name"		"gameplay"
+		"group_source_bindings"
+		{
+			"0"		"button_diamond active"
+			"1"		"dpad active"
+			"2"		"joystick active"
+			"3"		"right_joystick active"
+			"4"		"left_trigger active"
+			"5"		"right_trigger active"
+			"6"		"switch active"
+		}
+	}
+	"settings"
+	{
+	}
+}

@@ -13,6 +13,12 @@
 // "controller" only that one. The keyboard and mouse make user 0 a connected
 // controller.
 //
+// Controllers go to players in connection order, with Steam's virtual
+// controller in place of the real ones it hides (Steam Input, when the game
+// is attached to Steam; net/transport_steam.cpp). Controllers Steam has taken
+// over are also read through the Steam Input API and merged into player 1's
+// (steam_input.h): Spacewar's virtual controller sends nothing.
+//
 // While the game menu is open (game_menu.h), the game sees no input and its
 // main loop waits.
 
@@ -22,13 +28,16 @@
 #include <string>
 #include <vector>
 
+namespace rex::system {
+class IInputSystem;
+}
 namespace rex::ui {
 class Window;
 }
 
 namespace tenchuz::input {
 
-void Initialize(rex::ui::Window* window);
+void Initialize(rex::ui::Window* window, rex::system::IInputSystem* input_system);
 void Shutdown();
 
 // A bindable pad control.

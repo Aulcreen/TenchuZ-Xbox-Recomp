@@ -11,6 +11,8 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include <rex/memory/utils.h>
 #endif
 
 REXCVAR_DEFINE_STRING(tenchuz_aspect_ratio, "16:9", "tenchuz",
@@ -90,16 +92,21 @@ void PatchGame(uint8_t* virtual_membase) {
 #if defined(_WIN32)
   DWORD old_protect = 0;
   const bool unprotected = VirtualProtect(host, 4, PAGE_READWRITE, &old_protect);
+#else
+  rex::memory::PageAccess old_access = rex::memory::PageAccess::kReadOnly;
+  const bool unprotected = rex::memory::Protect(host, 4, rex::memory::PageAccess::kReadWrite, &old_access);
 #endif
   host[0] = uint8_t(bits >> 24);
   host[1] = uint8_t(bits >> 16);
   host[2] = uint8_t(bits >> 8);
   host[3] = uint8_t(bits);
-#if defined(_WIN32)
   if (unprotected) {
+#if defined(_WIN32)
     VirtualProtect(host, 4, old_protect, &old_protect);
-  }
+#else
+    rex::memory::Protect(host, 4, old_access);
 #endif
+  }
   REXLOG_INFO("tenchuz: aspect ratio {:.4f} ({}), patched at {:08X}", aspect, REXCVAR_GET(tenchuz_aspect_ratio),
               kAspectConstant);
 }

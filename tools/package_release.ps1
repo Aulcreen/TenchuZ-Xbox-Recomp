@@ -26,6 +26,9 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 $files = @("tenchuz.exe", "Setup.exe") + (Get-ChildItem $build -Filter "*.dll" | ForEach-Object { $_.Name })
 if (-not $NoPdb -and (Test-Path (Join-Path $build "tenchuz.pdb"))) { $files += "tenchuz.pdb" }  # symbolized crash reports
 foreach ($f in $files) { Copy-Item (Join-Path $build $f) $stage }
+# Steam Input's action manifest and controller configurations (src/input/steam_input.h).
+$steamInput = Join-Path $build "steam_input"
+if (Test-Path $steamInput) { Copy-Item -Recurse $steamInput $stage }
 
 # VC++ 2022 runtime, app-local (redistributable), from the build tools' redist folder.
 $redist = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\2022\*\VC\Redist\MSVC\*\x64\Microsoft.VC143.CRT" -Directory -ErrorAction SilentlyContinue |

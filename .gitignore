@@ -16,8 +16,22 @@ generated/*
 out/
 build/
 
-# Local tooling / downloads
-third_party/
+# Local tooling / downloads (build.bat and tools/macos/build.sh download the
+# ReXGlue SDK). Committed: the Steamworks headers and the Windows and macOS
+# Steam API libraries, which System Link over Steam builds with. Keep the
+# repository private: the Steamworks SDK agreement allows shipping the
+# libraries with the game, not publishing the SDK.
+third_party/*
+!third_party/steamworks/
+third_party/steamworks/*
+!third_party/steamworks/sdk/
+third_party/steamworks/sdk/*
+!third_party/steamworks/sdk/Readme.txt
+!third_party/steamworks/sdk/public/
+!third_party/steamworks/sdk/redistributable_bin/
+third_party/steamworks/sdk/redistributable_bin/*
+!third_party/steamworks/sdk/redistributable_bin/win64/
+!third_party/steamworks/sdk/redistributable_bin/osx/
 logs/
 *.log
 
@@ -26,3 +40,4 @@ __pycache__/
 
 # Release packages (tools/package_release.ps1)
 dist/
+third_party/steamworks/sdk/public/steam/lib/

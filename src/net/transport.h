@@ -11,6 +11,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace tenchuz::net {
 
@@ -38,8 +39,34 @@ class Transport {
 // Game instances on this PC, over 127.0.0.1 (for testing).
 std::unique_ptr<Transport> CreateLocalTransport();
 
+// At startup (TenchuzApp::OnPreSetup), before SDL opens the controllers: with
+// --tenchuz_netplay auto or steam, attaches to Steam (system_link.cpp).
+void StartNetwork();
+
 // Steam lobby members (transport_steam.cpp; built when the Steamworks SDK is
-// in third_party/steamworks, TENCHUZ_STEAM).
+// in third_party/steamworks, TENCHUZ_STEAM). StartSteam() attaches to Steam,
+// now or, while Steam isn't running, in the background once it is;
+// SteamReady() says it has. Start() fails until then.
+void StartSteam();
+bool SteamReady();
 std::unique_ptr<Transport> CreateSteamTransport();
+
+// For the game menu's Online tab.
+struct OnlineFriend {
+  uint64_t id = 0;
+  std::string name;
+  bool in_game = false;   // in a Tenchu Z lobby: Join
+  bool with_you = false;  // in your lobby
+};
+struct OnlineStatus {
+  bool steam = false;           // in a Steam lobby
+  bool steam_starting = false;  // attached, System Link not on Steam yet
+  std::string name;
+  int lobby_players = 0;
+  std::vector<OnlineFriend> friends;  // online, Tenchu Z players first
+};
+OnlineStatus GetOnlineStatus();
+void JoinFriend(uint64_t id);
+void InviteFriend(uint64_t id);
 
 }  // namespace tenchuz::net

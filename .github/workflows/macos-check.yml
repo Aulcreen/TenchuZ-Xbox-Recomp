@@ -1,0 +1,40 @@
+# Compiles the game's own sources for macOS (Apple Silicon) against the
+# prebuilt ReXGlue SDK. The recompiled game isn't in the repository, so the
+# app itself is built on a Mac with tools/macos/build.sh. Run by hand (Actions
+# > macOS compile check > Run workflow, or gh workflow run macos-check.yml):
+# macOS runner minutes count ten times on a private repository.
+name: macOS compile check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: macos-26
+    env:
+      SDK_TAG: nightly-20261002-bd833a2a
+      SDK_ZIP: rexglue-sdk-0.10.0.24-dev.gbd833a2-mac-arm64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - name: SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$SDK_TAG" -R rexglue/rexglue-sdk -p "$SDK_ZIP" -D "$RUNNER_TEMP"
+          unzip -q "$RUNNER_TEMP/$SDK_ZIP" -d "$RUNNER_TEMP/sdk"
+      - name: Stub generated headers
+        run: |
+          mkdir -p generated/default
+          cp tools/ci/macos/tenchuz_pch.h generated/default/tenchuz_pch.h
+          # The real one adds every recompiled function's declaration.
+          echo '#include "tenchuz_pch.h"' > generated/default/tenchuz_init.h
+      - name: Compile
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S tools/ci/macos -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/sdk/mac-arm64"
+          cmake --build build -- -k 0
+      - name: Shell scripts
+        run: bash -n tools/macos/build.sh && bash -n "tools/macos/Set Up Game Files.command"

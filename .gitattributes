@@ -5,3 +5,4 @@
 *.bat text eol=crlf
 # Shell scripts need LF for bash
 *.sh text eol=lf
+*.command text eol=lf

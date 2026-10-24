@@ -26,12 +26,15 @@
 #include <algorithm>
 #include <cstring>
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <timeapi.h>
+#endif
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 
 #include "debug_tools.h"
 #include "input/pc_input.h"
@@ -69,7 +72,11 @@ bool Want60() { return TargetRate() > 30; }
 
 namespace tenchuz::frame_rate {
 
-void Initialize() { timeBeginPeriod(1); }
+void Initialize() {
+#if defined(_WIN32)
+  timeBeginPeriod(1);
+#endif
+}
 
 // Frames are paced by the D3D in guest vblanks: interval 1 waits one, 2 waits
 // two. Full rate is interval 1 at that many vblanks a second; 30 fps is
@@ -120,8 +127,7 @@ REX_HOOK_RAW(sub_8228E5C8) {  // the main loop's frame timer: frame time in s at
   if (!Want60()) return;
   static bool writable = false;
   if (!writable) {
-    DWORD old_protect = 0;
-    writable = VirtualProtect(REX_RAW_ADDR(kStep30), 4, PAGE_READWRITE, &old_protect);
+    writable = rex::memory::Protect(REX_RAW_ADDR(kStep30), 4, rex::memory::PageAccess::kReadWrite);
     if (!writable) return;
   }
   uint32_t bits = REX_LOAD_U32(kFrameSeconds);

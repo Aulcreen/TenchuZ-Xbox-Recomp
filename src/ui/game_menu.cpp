@@ -24,6 +24,7 @@
 #include <rex/ui/windowed_app_context.h>
 
 #include "../input/pc_input.h"
+#include "../net/transport.h"
 #include "audio_volume.h"
 
 namespace tenchuz::game_menu {
@@ -44,12 +45,21 @@ void DeferClose(bool quit) {
   });
 }
 
+// The native renderer and the per-app volume are Windows only.
+#if defined(_WIN32)
+constexpr bool kWindows = true;
+#else
+constexpr bool kWindows = false;
+#endif
+
 // The settings the menu writes to tenchuz.toml (other lines there are kept).
 constexpr const char* kSavedSettings[] = {
-    "tenchuz_frame_rate",       "fullscreen",           "tenchuz_aspect_ratio", "tenchuz_native_resolution_scale",
-    "tenchuz_native_post_effect", "tenchuz_native_msaa_samples", "tenchuz_widescreen_hud", "tenchuz_input_device",
-    "tenchuz_mouse_camera",     "tenchuz_mouse_sensitivity", "tenchuz_mouse_invert_y", "tenchuz_walk_speed",
-    "tenchuz_volume",           "audio_mute",           "tenchuz_netplay",
+    "tenchuz_frame_rate",    "fullscreen",           "tenchuz_aspect_ratio",      "tenchuz_widescreen_hud",
+    "tenchuz_input_device",  "tenchuz_mouse_camera", "tenchuz_mouse_sensitivity", "tenchuz_mouse_invert_y",
+    "tenchuz_walk_speed",    "tenchuz_volume",       "audio_mute",                "tenchuz_netplay",
+#if defined(_WIN32)
+    "tenchuz_native_resolution_scale", "tenchuz_native_post_effect", "tenchuz_native_msaa_samples",
+#endif
 };
 
 // Settings the menu used to write: their lines are dropped.
@@ -279,6 +289,7 @@ class GameMenu final : public rex::ui::ImGuiDialog {
     Choice("Aspect ratio", "tenchuz_aspect_ratio",
            {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}, {"32:9", "32:9"}}, "(restart)");
     Check("HUD at 16:9", "tenchuz_widescreen_hud");
+    if (!kWindows) return;
     Choice("Resolution", "tenchuz_native_resolution_scale",
            {{"1", "720p (original)"}, {"2", "1440p (2x)"}, {"3", "2160p (3x)"}, {"4", "2880p (4x)"}},
            "(restart)");
@@ -363,6 +374,10 @@ class GameMenu final : public rex::ui::ImGuiDialog {
   }
 
   void DrawAudio() {
+    if (!kWindows) {
+      Check("Mute", "audio_mute");
+      return;
+    }
     int volume = std::atoi(Get("tenchuz_volume").c_str());
     Row("Volume", nullptr);
     if (ImGui::SliderInt("##volume", &volume, 0, 100, "%d%%")) {
@@ -375,6 +390,41 @@ class GameMenu final : public rex::ui::ImGuiDialog {
   void DrawOnline() {
     Choice("System Link", "tenchuz_netplay",
            {{"auto", "Steam if running"}, {"steam", "Steam"}, {"local", "This PC"}, {"off", "Off"}}, "(restart)");
+    const net::OnlineStatus status = net::GetOnlineStatus();
+    Row("Steam", nullptr);
+    ImGui::TextUnformatted(status.steam            ? status.name.c_str()
+                           : status.steam_starting ? "Connecting"
+                                                   : "Not running");
+    if (!status.steam) return;
+    Row("Lobby", nullptr);
+    ImGui::Text("%d %s", status.lobby_players, status.lobby_players == 1 ? "player" : "players");
+    ImGui::Separator();
+    ImGui::BeginChild("friends", ImVec2(0, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.2f),
+                      false);
+    ImGui::SetWindowFontScale(scale_);
+    if (ImGui::BeginTable("friends", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+      ImGui::TableSetupColumn("Friend", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+      ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+      ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+      ImGui::TableHeadersRow();
+      for (const net::OnlineFriend& f : status.friends) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(f.name.c_str());
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(f.with_you ? "In your lobby" : f.in_game ? "In Tenchu Z" : "Online");
+        ImGui::TableSetColumnIndex(2);
+        if (f.with_you) continue;
+        ImGui::PushID(std::to_string(f.id).c_str());  // stable across frames
+        if (ImGui::Button(f.in_game ? "Join" : "Invite", ImVec2(-1, 0))) {
+          f.in_game ? net::JoinFriend(f.id) : net::InviteFriend(f.id);
+        }
+        ImGui::PopID();
+      }
+      ImGui::EndTable();
+    }
+    ImGui::EndChild();
   }
 
   std::filesystem::path config_path_;

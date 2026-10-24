@@ -1,0 +1,146 @@
+"Action Manifest"
+{
+	"configurations"
+	{
+		"controller_xboxone"
+		{
+			"0"
+			{
+				"path"		"controller_xboxone.vdf"
+			}
+		}
+		"controller_xbox360"
+		{
+			"0"
+			{
+				"path"		"controller_xbox360.vdf"
+			}
+		}
+		"controller_ps3"
+		{
+			"0"
+			{
+				"path"		"controller_ps3.vdf"
+			}
+		}
+		"controller_ps4"
+		{
+			"0"
+			{
+				"path"		"controller_ps4.vdf"
+			}
+		}
+		"controller_ps5"
+		{
+			"0"
+			{
+				"path"		"controller_ps5.vdf"
+			}
+		}
+		"controller_switch_pro"
+		{
+			"0"
+			{
+				"path"		"controller_switch_pro.vdf"
+			}
+		}
+		"controller_generic"
+		{
+			"0"
+			{
+				"path"		"controller_generic.vdf"
+			}
+		}
+		"controller_neptune"
+		{
+			"0"
+			{
+				"path"		"controller_neptune.vdf"
+			}
+		}
+		"controller_android"
+		{
+			"0"
+			{
+				"path"		"controller_android.vdf"
+			}
+		}
+		"controller_apple"
+		{
+			"0"
+			{
+				"path"		"controller_apple.vdf"
+			}
+		}
+	}
+	"actions"
+	{
+		"gameplay"
+		{
+			"title"		"#set_gameplay"
+			"legacy_set"		"0"
+			"StickPadGyro"
+			{
+				"left_stick"
+				{
+					"title"		"#left_stick"
+					"input_mode"		"joystick_move"
+				}
+				"right_stick"
+				{
+					"title"		"#right_stick"
+					"input_mode"		"joystick_move"
+				}
+			}
+			"AnalogTrigger"
+			{
+				"left_trigger"		"#left_trigger"
+				"right_trigger"		"#right_trigger"
+			}
+			"Button"
+			{
+				"a"		"#a"
+				"b"		"#b"
+				"x"		"#x"
+				"y"		"#y"
+				"lb"		"#lb"
+				"rb"		"#rb"
+				"ls"		"#ls"
+				"rs"		"#rs"
+				"start"		"#start"
+				"back"		"#back"
+				"dpad_up"		"#dpad_up"
+				"dpad_down"		"#dpad_down"
+				"dpad_left"		"#dpad_left"
+				"dpad_right"		"#dpad_right"
+			}
+		}
+	}
+	"localization"
+	{
+		"english"
+		{
+			"title"		"Tenchu Z"
+			"description"		"Xbox 360 controller layout"
+			"set_gameplay"		"Gameplay"
+			"left_stick"		"Left stick"
+			"right_stick"		"Right stick"
+			"left_trigger"		"LT"
+			"right_trigger"		"RT"
+			"a"		"A"
+			"b"		"B"
+			"x"		"X"
+			"y"		"Y"
+			"lb"		"LB"
+			"rb"		"RB"
+			"ls"		"Left stick click"
+			"rs"		"Right stick click"
+			"start"		"Start"
+			"back"		"Back"
+			"dpad_up"		"D-pad up"
+			"dpad_down"		"D-pad down"
+			"dpad_left"		"D-pad left"
+			"dpad_right"		"D-pad right"
+		}
+	}
+}

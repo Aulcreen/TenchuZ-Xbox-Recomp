@@ -11,21 +11,46 @@ Code: `src/net/system_link.cpp` (virtual sockets and XNet),
 ## Using it
 
 - `--tenchuz_netplay=auto` (default): Steam if this build has the Steamworks SDK and Steam
-  is running, else local. `steam`, `local` and `off` force one (`off` leaves the SDK's
+  is running, else local. When Steam starts after the game, the game attaches to it within
+  5 s and System Link moves to Steam as soon as no System Link game is open. `steam`, `local` and `off` force one (`off` leaves the SDK's
   sockets, where System Link says no Ethernet cable is connected).
 - Local: start two instances with `--tenchuz_netplay=local`, each with its own
   `--user_data_root` copy of the save. With Steam running, `auto` would put both on the same
   Steam account and virtual address. Instance N listens on `127.0.0.1:47320+N-1`
   (`--tenchuz_net_local_port`) and is `10.92.0.N`. One picks Create Game, the other Search
   for Game.
-- Steam: needs the Steamworks SDK in `third_party/steamworks` at build time (the zip's
-  `sdk` folder, as `steamworks/` or `steamworks/sdk/`; built with v1.65). It is never
-  committed.
-  The game runs as App ID 480 (Spacewar), and `steam_api64.dll` is copied next to the exe.
-  Each player opens a friends-only lobby at start. Invite a friend from the Steam friends
-  list (Invite to Lobby), or let `--tenchuz_steam_autojoin` (default on) move a player who
-  is alone into a friend's Tenchu Z lobby (the lower SteamID hosts). Then Create Game and
-  Search for Game as on a LAN. The Steam name is the in-game name.
+- Steam: builds with the Steamworks SDK v1.65 in `third_party/steamworks/sdk`. The
+  repository carries the part it needs (headers, and the Windows and macOS Steam API
+  libraries); keep the repository private.
+  The game runs as App ID 480 (Spacewar), and `steam_api64.dll` (`libsteam_api.dylib` on
+  macOS) is copied next to the exe. Each player opens a friends-only lobby once Steam is
+  there. To get into one lobby: the game menu's Online tab (Esc) lists online friends, with
+  Join for a friend in Tenchu Z and Invite for the others; Steam's own Invite to Lobby and
+  Join Game (rich presence `connect`) work too while Tenchu Z is running (otherwise Steam
+  starts the real Spacewar); and `--tenchuz_steam_autojoin` (default on) moves a player who
+  is alone into a friend's Tenchu Z lobby (the lower SteamID hosts). The log says what each
+  friend is doing in App ID 480 when it changes ("netplay steam: <name> is ..."). Then
+  Create Game and Search for Game as on a LAN. The Steam name is the in-game name. Each
+  player needs their own Steam account.
+- Controllers with Steam: Spacewar opts every controller type into Steam Input. On Windows,
+  `SteamAPI_InitEx()` loads Steam's overlay into the game, which then hides the real
+  controller (inside the game, XInput reports no controller in any slot), and Spacewar's own
+  Steam Input configuration drives no virtual controller either, whether Steam started before
+  or after the game. So the game reads those controllers through the Steam Input API with its
+  own action manifest (`steam_input/` next to the exe, from `src/input/steam_input/`): one
+  action per pad control, a configuration per controller type, merged into player 1's pad
+  (`src/input/steam_input.cpp`). Steam applies a game's configuration only while its window
+  has focus (otherwise its desktop configuration), so a console tool without a window reads
+  nothing. Without Steam, SDL reads the controller as before. On macOS Steam has no virtual
+  controller, so SDL keeps reading the real one (`TenchuzApp::OnPreSetup` clears
+  `SDL_GAMECONTROLLER_IGNORE_DEVICES`); the Steam Input reading merges into the same pad.
+- "Connection with the host was lost" (2026-10-24, PC joining the Mac): the PC's game thread
+  presented no frame for 9.5 s, then showed the error. Not the network (both on one LAN,
+  Steam reported no failure) and not the Esc menu (frames go on while it's open). Cause
+  unknown; the diagnostics below catch the next one.
+- Diagnostics: a lobby member that sends nothing for 2 s is logged with Steam's connection
+  state, ping and quality ("netplay steam: nothing from <name> ..."), and on Windows a game
+  thread that presents no frame for 2 s is logged with its call stack.
 - `--tenchuz_net_log=true` logs every socket, XNet and stream frame.
 
 ## What the game does

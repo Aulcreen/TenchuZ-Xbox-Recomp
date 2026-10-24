@@ -5,6 +5,7 @@
 // Loopback UDP is not formally reliable, but with large socket buffers it
 // doesn't drop in practice, which is enough for testing.
 
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,6 +15,27 @@
 
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
+namespace {
+int LastError() { return WSAGetLastError(); }
+}  // namespace
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cerrno>
+
+namespace {
+using SOCKET = int;
+constexpr SOCKET INVALID_SOCKET = -1;
+int closesocket(SOCKET s) { return close(s); }
+int LastError() { return errno; }
+}  // namespace
 #endif
 
 #include <cstring>
@@ -47,23 +69,27 @@ class LocalTransport final : public Transport {
   }
 
   bool Start() override {
+#if defined(_WIN32)
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
       REXLOG_ERROR("tenchuz: netplay local: WSAStartup failed");
       return false;
     }
+#endif
     socket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_ == INVALID_SOCKET) {
-      REXLOG_ERROR("tenchuz: netplay local: socket failed ({})", WSAGetLastError());
+      REXLOG_ERROR("tenchuz: netplay local: socket failed ({})", LastError());
       return false;
     }
     const int buffer = 8 << 20;
     setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buffer), sizeof(buffer));
     setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buffer), sizeof(buffer));
+#if defined(_WIN32)
     // Broadcasts reach empty slots too; don't let their ICMP replies fail recv.
     BOOL report = FALSE;
     DWORD unused = 0;
     WSAIoctl(socket_, SIO_UDP_CONNRESET, &report, sizeof(report), nullptr, 0, &unused, nullptr, nullptr);
+#endif
     base_port_ = REXCVAR_GET(tenchuz_net_local_port);
     for (int slot = 0; slot < kSlots; ++slot) {
       sockaddr_in addr = Address(slot);
@@ -112,13 +138,22 @@ class LocalTransport final : public Transport {
     FD_ZERO(&read_set);
     FD_SET(socket_, &read_set);
     timeval timeout{0, timeout_ms * 1000};
-    if (select(0, &read_set, nullptr, nullptr, &timeout) <= 0) return;
+    if (select(int(socket_) + 1, &read_set, nullptr, nullptr, &timeout) <= 0) return;
     for (;;) {
+#if defined(_WIN32)
       u_long pending = 0;
       if (ioctlsocket(socket_, FIONREAD, &pending) != 0 || !pending) return;
-      const int got = recv(socket_, reinterpret_cast<char*>(buffer_.data()), int(buffer_.size()), 0);
+#else
+      int pending = 0;
+      if (ioctl(socket_, FIONREAD, &pending) != 0 || !pending) return;
+#endif
+      const int got = int(recv(socket_, reinterpret_cast<char*>(buffer_.data()), int(buffer_.size()), 0));
       if (got < int(sizeof(Header))) {
-        if (got < 0 && WSAGetLastError() != WSAECONNRESET) return;
+#if defined(_WIN32)
+        if (got < 0 && LastError() != WSAECONNRESET) return;
+#else
+        if (got < 0 && LastError() != ECONNREFUSED) return;
+#endif
         continue;
       }
       Header header;

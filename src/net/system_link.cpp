@@ -45,9 +45,13 @@
 
 #include "transport.h"
 
+#ifndef TENCHUZ_STEAM
+#define TENCHUZ_STEAM 0
+#endif
+
 REXCVAR_DEFINE_STRING(tenchuz_netplay, "auto", "tenchuz",
                       "System Link network: steam (Steam lobby), local (game instances on this PC), "
-                      "auto (steam if Steam is running, else local) or off (the SDK's sockets)");
+                      "auto (steam once Steam is running, local until then) or off (the SDK's sockets)");
 REXCVAR_DEFINE_BOOL(tenchuz_net_log, false, "tenchuz", "Log the game's socket, XNet and session calls");
 
 namespace {
@@ -135,6 +139,8 @@ struct Net {
   std::unique_ptr<tenchuz::net::Transport> transport;
   uint32_t local_ip = 0;
   std::string name;  // from the transport (Steam name); empty keeps the profile's
+  bool waiting_for_steam = false;  // on local until Steam is there (Pump switches)
+  uint8_t* base = nullptr;         // guest memory, for PatchUsers after a switch
   std::unordered_map<uint32_t, std::shared_ptr<Socket>> sockets;
   std::map<ConnKey, std::shared_ptr<Socket>> connections;
   uint32_t next_handle = 0x5E000004u;
@@ -166,15 +172,25 @@ std::string Hex(const uint8_t* data, size_t size, size_t max = 48) {
 
 void Pump();
 
+bool WantsSteam(const std::string& mode) { return TENCHUZ_STEAM && (mode == "steam" || mode == "auto"); }
+
+// Steam once it's there (StartSteam at startup), and until then the local
+// network, which Pump swaps for Steam when Steam comes.
 std::unique_ptr<tenchuz::net::Transport> StartTransport(const std::string& mode) {
   std::unique_ptr<tenchuz::net::Transport> transport;
 #if TENCHUZ_STEAM
-  if (mode == "steam" || mode == "auto") transport = tenchuz::net::CreateSteamTransport();
+  if (WantsSteam(mode)) {
+    tenchuz::net::StartSteam();
+    transport = tenchuz::net::CreateSteamTransport();
+    if (!transport->Start()) {
+      transport.reset();
+      N().waiting_for_steam = true;
+    }
+  }
 #else
   if (mode == "steam") REXLOG_WARN("tenchuz: this build has no Steam (no Steamworks SDK at build time)");
 #endif
-  if (transport && !transport->Start()) transport.reset();
-  if (!transport && (mode == "local" || mode == "auto")) {
+  if (!transport && mode != "off") {
     transport = tenchuz::net::CreateLocalTransport();
     if (!transport->Start()) transport.reset();
   }
@@ -414,9 +430,39 @@ void DeliverLocked(uint32_t src_ip, const uint8_t* data, size_t size) {
   Notify(*s);
 }
 
+void PatchUsers(uint8_t* base);
+
+#if TENCHUZ_STEAM
+// While System Link is closed (no sockets), moves from the local network to
+// Steam once Steam is there: new address, Steam name, players' XUIDs again.
+void MaybeSwitchToSteam() {
+  Net& n = N();
+  if (!n.waiting_for_steam || !tenchuz::net::SteamReady()) return;
+  std::lock_guard lock(n.mutex);
+  if (!n.sockets.empty()) {
+    static bool logged = false;
+    if (!logged) REXLOG_INFO("tenchuz: netplay: Steam is here; System Link moves to it when this game closes");
+    logged = true;
+    return;
+  }
+  auto steam = tenchuz::net::CreateSteamTransport();
+  if (!steam->Start()) return;
+  n.waiting_for_steam = false;
+  n.transport = std::move(steam);
+  n.local_ip = n.transport->LocalIp();
+  n.name = n.transport->PlayerName();
+  n.connections.clear();
+  if (n.base) PatchUsers(n.base);
+  REXLOG_INFO("tenchuz: netplay: System Link is on Steam now ({})", IpText(n.local_ip));
+}
+#endif
+
 void Pump() {
   Net& n = N();
   for (;;) {
+#if TENCHUZ_STEAM
+    MaybeSwitchToSteam();
+#endif
     n.transport->Receive(20, [&](uint32_t src_ip, const uint8_t* data, size_t size) {
       std::lock_guard lock(n.mutex);
       DeliverLocked(src_ip, data, size);
@@ -1053,10 +1099,9 @@ NET_TRACE(sub_8250C348, "XNetCleanup", 0)
 // address as their low half. The SDK keeps its own XUID for the save folder,
 // and the save itself doesn't store it. With Steam, the name other players
 // see (the profile's is "User") becomes the Steam name.
-REX_EXTERN(__imp__sub_8228BF30);
-REX_HOOK_RAW(sub_8228BF30) {
-  __imp__sub_8228BF30(ctx, base);
-  if (!Active()) return;
+namespace {
+
+void PatchUsers(uint8_t* base) {
   constexpr uint32_t kUsers = 0x82B57390;       // 4 x 32 bytes: XUID, ..., state at +12, name at +16
   constexpr uint32_t kActiveUser = 0x82B57430;  // XUID of the user playing
   constexpr uint32_t kNameSize = 16;
@@ -1078,6 +1123,32 @@ REX_HOOK_RAW(sub_8228BF30) {
   }
   patch(kActiveUser);
 }
+
+}  // namespace
+
+REX_EXTERN(__imp__sub_8228BF30);
+REX_HOOK_RAW(sub_8228BF30) {
+  __imp__sub_8228BF30(ctx, base);
+  if (!Active()) return;
+  N().base = base;
+  PatchUsers(base);
+}
+
+namespace tenchuz::net {
+
+void StartNetwork() {
+  if (WantsSteam(REXCVAR_GET(tenchuz_netplay))) StartSteam();
+}
+
+#if !TENCHUZ_STEAM
+void StartSteam() {}
+bool SteamReady() { return false; }
+OnlineStatus GetOnlineStatus() { return {}; }
+void JoinFriend(uint64_t) {}
+void InviteFriend(uint64_t) {}
+#endif
+
+}  // namespace tenchuz::net
 
 // XUserMuteListQuery(user_index, xuid): XLIVEBASE message 0x5800E, which the
 // SDK doesn't implement (it logs an error per player). Nobody is muted.

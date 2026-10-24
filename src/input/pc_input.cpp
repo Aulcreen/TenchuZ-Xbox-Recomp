@@ -12,6 +12,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 
@@ -24,6 +25,21 @@
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 #include <rex/ui/windowed_app_context.h>
+
+#include <rex/input/device_assignment.h>
+#include <rex/input/input_system.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+#include "steam_input.h"
 
 #include "../debug_tools.h"
 #include "../profiler.h"
@@ -274,9 +290,13 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
     const double dt = std::clamp(std::chrono::duration<double>(now - last_poll_).count(), 1.0 / 240.0, 1.0 / 15.0);
     last_poll_ = now;
 
+    // Controllers Steam has taken over, which SDL can't read (steam_input.h).
+    PadState steam_pad;
+    const bool steam_controller = ReadSteamControllers(steam_pad);
+
     // The device the game reads: tenchuz_input_device, where "auto" picks a
     // connected controller and otherwise the keyboard and mouse.
-    const bool controller_connected = result == 0;
+    const bool controller_connected = result == 0 || steam_controller;
     const std::string choice = REXCVAR_GET(tenchuz_input_device);
     const Device device = choice == "controller" ? Device::kController
                           : choice == "keyboard" ? Device::kKeyboard
@@ -290,9 +310,16 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
     }
     const bool keyboard = device == Device::kKeyboard;
     Pad pad;
-    if (controller_connected && !keyboard) pad = Read(base, state);
+    if (!keyboard) {
+      if (result == 0) pad = Read(base, state);
+      if (steam_controller) Merge(pad, steam_pad);
+    }
+    if (!controller_input_seen_ && (pad.buttons || pad.lt || pad.rt)) {
+      controller_input_seen_ = true;
+      REXLOG_INFO("tenchuz: input: first controller input (buttons {:#06x})", pad.buttons);
+    }
     if (menu_open_) {
-      if (result == 0 || keyboard) {
+      if (controller_connected || keyboard) {
         Clear(base, state);
         return 0;
       }
@@ -424,6 +451,22 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
   }
 
   void Clear(uint8_t* base, uint32_t state) const { Write(base, state, Pad{}); }
+
+  // Another controller's state into `pad`: buttons and triggers combine, and
+  // each stick takes the larger deflection.
+  static void Merge(Pad& pad, const PadState& other) {
+    pad.buttons |= other.buttons;
+    pad.lt = std::max(pad.lt, other.lt);
+    pad.rt = std::max(pad.rt, other.rt);
+    auto stick = [](int32_t& x, int32_t& y, int32_t ox, int32_t oy) {
+      if (ox * ox + oy * oy > x * x + y * y) {
+        x = ox;
+        y = oy;
+      }
+    };
+    stick(pad.lx, pad.ly, other.lx, other.ly);
+    stick(pad.rx, pad.ry, other.rx, other.ry);
+  }
 
   // The mouse is captured (hidden, relative motion) while the camera uses it,
   // the window has focus and the menu is closed.
@@ -596,6 +639,7 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
   bool capture_wanted_ = false;
   std::atomic<Device> active_device_{Device::kKeyboard};
   bool controller_seen_ = false;
+  bool controller_input_seen_ = false;
   bool capturing_ = false;
   std::string captured_;
   std::vector<ScriptStep> script_;
@@ -628,9 +672,94 @@ const ControlDef* FindControl(const char* id) {
   return nullptr;
 }
 
+// Which controller plays which guest user: device N (in connection order) is
+// user N, as the SDK's SlotAssignment does, except that Steam's virtual
+// controller replaces the real ones it stands for. In a game Steam knows (App
+// ID 480 here), Steam Input hides the real controller and offers a virtual
+// one, and SteamAPI_InitEx() lists the controllers it hides in
+// SDL_GAMECONTROLLER_IGNORE_DEVICES. SDL reads that list when it starts, so
+// when Steam came after SDL had opened the controller (Steam started after
+// the game), the real one stayed open, read nothing, and was user 0. While
+// the virtual controller is there, the listed real ones are skipped. (With
+// Spacewar's own Steam Input configuration the virtual controller sends
+// nothing; the controllers then come through the Steam Input API instead,
+// steam_input.h.)
+class ControllerAssignment final : public rex::input::DeviceAssignment {
+ public:
+  void OnDevicesChanged(const std::vector<rex::input::DeviceInfo>& devices) override {
+    for (auto& user : users_) user.clear();
+    const bool steam_virtual = std::any_of(devices.begin(), devices.end(), IsSteamVirtual);
+    const std::string hidden = steam_virtual ? Environment("SDL_GAMECONTROLLER_IGNORE_DEVICES") : "";
+    uint32_t next_user = 0;
+    for (const auto& device : devices) {  // sorted by connection order
+      if (device.synthetic) {
+        users_[0].push_back(device.id);
+        continue;
+      }
+      const auto [vendor, product] = VendorProduct(device.guid);
+      REXLOG_INFO("tenchuz: input: controller \"{}\" ({:04x}:{:04x}){}", device.name, vendor, product,
+                  IsSteamVirtual(device) ? ", Steam's virtual controller" : "");
+      if (steam_virtual && !IsSteamVirtual(device) && Listed(hidden, device)) {
+        REXLOG_INFO("tenchuz: input: {} is behind Steam's virtual controller", device.name);
+        continue;
+      }
+      if (next_user < users_.size()) users_[next_user++].push_back(device.id);
+    }
+  }
+
+  void DevicesForUser(uint32_t user_index, std::vector<rex::input::DeviceId>& out) const override {
+    out.clear();
+    if (user_index < users_.size()) out = users_[user_index];
+  }
+
+ private:
+  // USB vendor and product from an SDL GUID (hex bytes; little-endian
+  // vendor at bytes 4-5, product at 8-9).
+  static std::pair<uint16_t, uint16_t> VendorProduct(const std::string& guid) {
+    if (guid.size() < 20) return {0, 0};
+    auto byte = [&](size_t i) { return uint16_t(std::strtoul(guid.substr(i * 2, 2).c_str(), nullptr, 16)); };
+    return {uint16_t(byte(4) | byte(5) << 8), uint16_t(byte(8) | byte(9) << 8)};
+  }
+
+  static bool IsSteamVirtual(const rex::input::DeviceInfo& device) {
+    const auto [vendor, product] = VendorProduct(device.guid);
+    return !device.synthetic &&
+           ((vendor == 0x28DE && product == 0x11FF) || device.name.find("Steam Virtual") != std::string::npos);
+  }
+
+  // `list` is "0xVVVV/0xPPPP,..." (any case).
+  static bool Listed(const std::string& list, const rex::input::DeviceInfo& device) {
+    const auto [vendor, product] = VendorProduct(device.guid);
+    char entry[16];
+    std::snprintf(entry, sizeof(entry), "0x%04x/0x%04x", vendor, product);
+    std::string lower = list;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return vendor && lower.find(entry) != std::string::npos;
+  }
+
+  // The process environment, where SteamAPI_InitEx() puts it.
+  static std::string Environment(const char* name) {
+#if defined(_WIN32)
+    char value[32768];
+    const DWORD size = GetEnvironmentVariableA(name, value, DWORD(sizeof(value)));
+    return size && size < sizeof(value) ? std::string(value, size) : std::string();
+#else
+    const char* value = std::getenv(name);
+    return value ? value : "";
+#endif
+  }
+
+  std::array<std::vector<rex::input::DeviceId>, rex::input::kMaxGuestUsers> users_;
+};
+
 }  // namespace
 
-void Initialize(rex::ui::Window* window) {
+void Initialize(rex::ui::Window* window, rex::system::IInputSystem* input_system) {
+  if (auto* inputs = dynamic_cast<rex::input::InputSystem*>(input_system)) {
+    inputs->SetDeviceAssignment(std::make_unique<ControllerAssignment>());
+  } else {
+    REXLOG_WARN("tenchuz: input: the input system isn't the SDK's InputSystem, controllers keep the SDK's assignment");
+  }
   if (window) g_input.Attach(window);
 }
 
