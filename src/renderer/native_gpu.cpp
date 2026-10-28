@@ -11,6 +11,10 @@
 #include "generated/default/tenchuz_pch.h"
 
 #include <windows.h>
+// windows.h must come first
+#include <dxgi.h>
+#include <wrl/client.h>
+#pragma comment(lib, "dxgi.lib")
 
 #include <algorithm>
 #include <array>
@@ -49,6 +53,10 @@ REXCVAR_DEFINE_BOOL(tenchuz_native_gpu, true, "tenchuz",
                     "executes only what the game observes (fences, interrupts, waits). false: the Xenos GPU "
                     "emulator (rexgpu-xenos) with native output switchable by F10");
 
+REXCVAR_DEFINE_BOOL(tenchuz_display_vblank, true, "tenchuz",
+                    "On a display refreshing at a multiple of 60 Hz (60, 120, 180, 240), time the game's "
+                    "vblanks by the display's own, so each frame stays on screen equally long");
+
 namespace tenchuz::native {
 namespace {
 
@@ -57,6 +65,156 @@ namespace {
 // it instead of spinning (the sub_82425790 hook below).
 std::atomic<uint32_t> g_progress{0};
 std::atomic<double> g_vblank_hz{0.0};  // SetVblankRate
+std::atomic<uint64_t> g_display_vblanks{0};  // DisplayVblanks
+
+// The game's vblanks from the display's: one every `per_guest` display
+// vblanks, when the display refreshes at a whole multiple of the guest rate.
+// On a timer of its own, 60 Hz drifts against the display's 180 (or 60, 120,
+// 240): frames then stay on screen for 2 or 4 refreshes now and then instead
+// of 3, which shows as stutter when the camera pans. Displays at other rates
+// (144 Hz) keep the timer.
+class DisplayVblank {
+ public:
+  // Waits for the next guest vblank. False (at once): not usable now; the
+  // caller times the vblank itself.
+  bool Wait(double guest_hz) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_check_) {
+      next_check_ = now + std::chrono::seconds(1);
+      Update(guest_hz);
+    }
+    if (!per_guest_) {
+      return false;
+    }
+    // WaitForVBlank sometimes returns at once (while loading, a display
+    // asleep): a vblank counts only half a refresh or more after the last.
+    // Many early returns in a row: no clock, the timer until the next check.
+    const auto min_gap = std::chrono::duration<double>(0.5 / display_hz_);
+    for (uint32_t i = 0, early = 0; i < per_guest_;) {
+      if (FAILED(output_->WaitForVBlank())) {
+        Drop();
+        return false;
+      }
+      const auto at = std::chrono::steady_clock::now();
+      if (at - last_vblank_ < min_gap) {
+        if (++early > 16) {
+          Drop();
+          return false;
+        }
+        continue;
+      }
+      last_vblank_ = at;
+      ++i;
+      g_display_vblanks.fetch_add(1, std::memory_order_relaxed);
+    }
+    // The game hands its frame over within a millisecond or so of its
+    // vblank. Raised at the display's, that lands on a refresh boundary, and
+    // the frame shows one refresh early or late at random (2 or 4 at 180 Hz
+    // instead of 3). A third of a refresh later, it lands between two.
+    LARGE_INTEGER due;
+    due.QuadPart = -LONGLONG(1e7 / 3 / display_hz_);
+    if (timer_ && SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE)) {
+      WaitForSingleObject(timer_, INFINITE);
+    }
+    return true;
+  }
+
+  ~DisplayVblank() {
+    if (timer_) CloseHandle(timer_);
+  }
+
+ private:
+  void Drop() {
+    g_display_vblanks.store(0, std::memory_order_relaxed);
+    output_.Reset();
+    monitor_ = nullptr;
+    per_guest_ = 0;
+  }
+
+  // The display the game window is on, and how many of its vblanks make one
+  // of the guest's.
+  void Update(double guest_hz) {
+    HWND window = nullptr;
+    if (REXCVAR_GET(tenchuz_display_vblank)) {
+      EnumWindows(
+          [](HWND hwnd, LPARAM param) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER)) {
+              return TRUE;
+            }
+            *reinterpret_cast<HWND*>(param) = hwnd;
+            return FALSE;
+          },
+          LPARAM(&window));
+    }
+    if (!window || IsIconic(window)) {
+      Drop();
+      return;
+    }
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    if (!GetMonitorInfoW(monitor, &info) || !EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) {
+      Drop();
+      return;
+    }
+    // Display rates are rounded (180 for 179.96 Hz): within 1 Hz of a multiple.
+    const double display_hz = double(mode.dmDisplayFrequency);
+    const uint32_t per_guest = uint32_t(display_hz / guest_hz + 0.5);
+    const bool multiple = per_guest >= 1 && per_guest <= 8 && std::abs(display_hz - per_guest * guest_hz) <= 1.0;
+    if (!multiple) {
+      if (per_guest_ || !logged_) {
+        REXLOG_INFO("tenchuz: native GPU: display at {} Hz isn't a multiple of {} Hz; vblanks on a timer",
+                    mode.dmDisplayFrequency, guest_hz);
+        logged_ = true;
+      }
+      Drop();
+      return;
+    }
+    if (monitor == monitor_ && output_ && per_guest == per_guest_) {
+      return;
+    }
+    if (!factory_ && FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory_)))) {
+      Drop();
+      return;
+    }
+    Drop();
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    for (UINT a = 0; !output_ && SUCCEEDED(factory_->EnumAdapters(a, adapter.ReleaseAndGetAddressOf())); ++a) {
+      Microsoft::WRL::ComPtr<IDXGIOutput> output;
+      for (UINT o = 0; SUCCEEDED(adapter->EnumOutputs(o, output.ReleaseAndGetAddressOf())); ++o) {
+        DXGI_OUTPUT_DESC desc;
+        if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == monitor) {
+          output_ = output;
+          break;
+        }
+      }
+    }
+    if (!output_) {
+      factory_.Reset();  // displays changed since it was made
+      return;
+    }
+    monitor_ = monitor;
+    per_guest_ = per_guest;
+    display_hz_ = display_hz;
+    REXLOG_INFO("tenchuz: native GPU: vblanks from the display's ({} Hz, every {})", mode.dmDisplayFrequency,
+                per_guest);
+    logged_ = true;
+  }
+
+  Microsoft::WRL::ComPtr<IDXGIFactory1> factory_;
+  Microsoft::WRL::ComPtr<IDXGIOutput> output_;
+  HMONITOR monitor_ = nullptr;
+  uint32_t per_guest_ = 0;
+  double display_hz_ = 60;
+  std::chrono::steady_clock::time_point last_vblank_{};
+  HANDLE timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  bool logged_ = false;
+  std::chrono::steady_clock::time_point next_check_{};
+};
 
 void Progress() {
   g_progress.fetch_add(1, std::memory_order_release);
@@ -137,7 +295,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                 TIMER_ALL_ACCESS);
           const double ticks_per_100ns = double(rex::chrono::Clock::guest_tick_frequency()) / 1e7;
+          DisplayVblank display;
           while (running_) {
+            if (g_vblank_hz.load(std::memory_order_relaxed) <= 0 && display.Wait(mode_hz)) {
+              ++counter_;
+              DispatchInterrupt(0, 2);
+              Progress();
+              last = rex::chrono::Clock::QueryGuestTickCount();  // the timer picks up from here
+              continue;
+            }
             const uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
             const double want = g_vblank_hz.load(std::memory_order_relaxed);
             if (want != hz) {  // a new rate starts from now, without a burst of catch-up vblanks
@@ -446,9 +612,16 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const uint32_t mask = reader->ReadAndSwap<uint32_t>();
         const uint32_t wait = reader->ReadAndSwap<uint32_t>();
         skip_rest(5);
+        // Until it holds: woken as soon as anything moves (a vblank, the
+        // command processor, a CPU write the D3D signals through Progress),
+        // else every millisecond. Sleeping whole milliseconds between checks
+        // released the game up to a millisecond late after each vblank, and
+        // frames came out unevenly (18-20 ms ones followed by short ones).
         while (!Compare(info, ReadPolled(address, info & 0x10) & mask, ref)) {
           if (wait >= 0x100) {
-            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+            const uint32_t seen = g_progress.load(std::memory_order_acquire);
+            if (Compare(info, ReadPolled(address, info & 0x10) & mask, ref)) break;
+            WaitOnAddress(&g_progress, const_cast<uint32_t*>(&seen), sizeof(seen), 1);
             rex::thread::SyncMemory();
             if (!running_) {
               return false;
@@ -649,6 +822,8 @@ bool NativeGpu() {
 }
 
 void SetVblankRate(double hz) { g_vblank_hz.store(hz, std::memory_order_relaxed); }
+
+uint64_t DisplayVblanks() { return g_display_vblanks.load(std::memory_order_relaxed); }
 
 std::unique_ptr<rex::system::IGraphicsSystem> CreateNativeGraphicsSystem() {
   return std::make_unique<NativeGraphicsSystem>();

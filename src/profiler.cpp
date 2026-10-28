@@ -18,6 +18,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -190,7 +191,11 @@ std::string Table(const char* title, const Counts& counts, size_t total) {
 std::string Report(const std::vector<Thread>& threads, double seconds) {
   HANDLE process = GetCurrentProcess();
   SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-  const bool symbols = SymInitialize(process, nullptr, TRUE);
+  // Someone else in the process (the SDK's crash handler) may have started
+  // DbgHelp already: then its session is used, and left running.
+  const bool own_symbols = SymInitialize(process, nullptr, TRUE);
+  const bool symbols = own_symbols || GetLastError() == ERROR_INVALID_PARAMETER;
+  if (!own_symbols && symbols) SymRefreshModuleList(process);
   std::unordered_map<uint64_t, std::string> names;
   auto name_of = [&](uint64_t start) -> const std::string& {
     auto it = names.find(start);
@@ -201,7 +206,16 @@ std::string Report(const std::vector<Thread>& threads, double seconds) {
     info->SizeOfStruct = sizeof(SYMBOL_INFO);
     info->MaxNameLen = 255;
     DWORD64 displacement = 0;
-    if (symbols && SymFromAddr(process, start, &displacement, info)) name = info->Name;
+    if (symbols && SymFromAddr(process, start, &displacement, info)) {
+      name = info->Name;
+    } else if (HMODULE module = nullptr; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                             reinterpret_cast<LPCWSTR>(start), &module)) {
+      char path[MAX_PATH] = {};
+      GetModuleFileNameA(module, path, MAX_PATH);
+      const char* file = std::strrchr(path, '\\');
+      name = fmt::format("{}+0x{:X}", file ? file + 1 : path, start - uint64_t(module));  // for llvm-symbolizer
+    }
     // __imp__sub_X is the body behind the hookable sub_X; count them as one.
     if (name.rfind("__imp__", 0) == 0) name = name.substr(7);
     return names.emplace(start, std::move(name)).first->second;
@@ -215,23 +229,29 @@ std::string Report(const std::vector<Thread>& threads, double seconds) {
     // self: innermost frame. guest self: innermost recompiled (sub_) frame.
     // inclusive: every function on the stack. Samples in a kernel wait or in
     // D3D Swap (sub_8241BF50, the frame's vblank wait) don't count as work.
-    Counts self, guest_self, inclusive;
+    Counts self, guest_self, inclusive, waiting;  // waiting: where a thread blocks, outside the vblank wait
     std::unordered_set<std::string> seen;
     std::vector<const std::string*> frames;
     size_t work = 0;
     for (size_t s = 0; s < t.samples; ++s) {
       const uint64_t* stack = &t.pcs[s * kMaxDepth];
       frames.clear();
-      bool idle = false;
+      bool idle = false, in_swap = false;
       for (int d = 0; d < kMaxDepth && stack[d]; ++d) {
         const std::string& name = name_of(FunctionStart(stack[d]));
         frames.push_back(&name);
-        idle |= name == "sub_8241BF50";
+        in_swap |= name == "sub_8241BF50" || name == "sub_8241BDE0";
         if (d == 0) idle |= name.rfind("Zw", 0) == 0 || name.rfind("Nt", 0) == 0;
       }
       if (frames.empty()) continue;
       ++self[*frames[0]];
-      if (idle) continue;
+      if (idle && !in_swap) {
+        seen.clear();
+        for (const std::string* name : frames) {
+          if (seen.insert(*name).second) ++waiting[*name];
+        }
+      }
+      if (idle || in_swap) continue;
       ++work;
       seen.clear();
       bool guest_found = false;
@@ -248,8 +268,9 @@ std::string Report(const std::vector<Thread>& threads, double seconds) {
     text += Table("self, all samples", self, t.samples);
     text += Table("guest self, working samples", guest_self, work);
     text += Table("inclusive, working samples", inclusive, work);
+    text += Table("waiting (blocked outside the vblank wait), inclusive", waiting, t.samples);
   }
-  if (symbols) SymCleanup(process);
+  if (own_symbols) SymCleanup(process);
   return text;
 }
 

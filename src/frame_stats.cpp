@@ -134,6 +134,13 @@ double g_smoothed_ms = 0;
 // Current logging window.
 uint32_t g_window_frames = 0;
 double g_window_worst_ms = 0;
+uint32_t g_window_missed = 0;  // frames longer than a 60 Hz frame (dips)
+// The game's own work per frame: from the end of one Swap to its next wait
+// for the presentation interval (sub_8241BDE0), so without the vblank wait.
+Clock::time_point g_swap_end;
+double g_window_work_ms = 0, g_window_worst_work_ms = 0;
+uint32_t g_window_work_over = 0, g_window_work_frames = 0;
+uint32_t g_spikes_logged = 0;
 
 void OnGuestSwap() {
   const auto now = Clock::now();
@@ -149,19 +156,50 @@ void OnGuestSwap() {
   g_smoothed_ms = g_smoothed_ms == 0 ? ms : g_smoothed_ms * 0.9 + ms * 0.1;
   ++g_window_frames;
   g_window_worst_ms = std::max(g_window_worst_ms, ms);
+  // Dips: a frame past one 60 Hz period (with 1 ms of slack). Long ones are
+  // logged one by one (the renderer logs slow shader and pipeline work by
+  // frame too), at most 400 a run.
+  if (ms > 17.7) ++g_window_missed;
+  if (ms > 25.0 && g_spikes_logged < 400) {
+    ++g_spikes_logged;
+    REXLOG_INFO("tenchuz: long frame {:.1f} ms (frame {})", ms, g_frame_count);
+  }
 
   const auto elapsed = now - g_window_start;
   if (elapsed >= kLogInterval) {
     const double seconds = std::chrono::duration<double>(elapsed).count();
-    REXLOG_INFO("tenchuz: frames {:.1f} fps avg, worst frame {:.1f} ms ({} frames)",
-                g_window_frames / seconds, g_window_worst_ms, g_frame_count);
+    REXLOG_INFO("tenchuz: frames {:.1f} fps avg, worst frame {:.1f} ms, {} over 17.7 ms ({} frames); work "
+                "{:.1f} ms avg, {:.1f} worst, {} over 16.7",
+                g_window_frames / seconds, g_window_worst_ms, g_window_missed, g_frame_count,
+                g_window_work_frames ? g_window_work_ms / g_window_work_frames : 0.0, g_window_worst_work_ms,
+                g_window_work_over);
+    g_window_work_ms = g_window_worst_work_ms = 0;
+    g_window_work_over = g_window_work_frames = 0;
     g_window_start = now;
     g_window_frames = 0;
     g_window_worst_ms = 0;
+    g_window_missed = 0;
   }
 }
 
 }  // namespace
+
+void OnPresentWait() {
+  const auto now = Clock::now();
+  std::lock_guard lock(g_mutex);
+  if (g_swap_end == Clock::time_point()) return;
+  const double ms = std::chrono::duration<double, std::milli>(now - g_swap_end).count();
+  g_window_work_ms += ms;
+  g_window_worst_work_ms = std::max(g_window_worst_work_ms, ms);
+  g_window_work_over += ms > 16.7;
+  ++g_window_work_frames;
+  g_swap_end = Clock::time_point();
+}
+
+void OnSwapEnd() {
+  std::lock_guard lock(g_mutex);
+  g_swap_end = Clock::now();
+}
 
 rex::ui::FrameStats GetFrameStats() {
   std::lock_guard lock(g_mutex);
@@ -184,4 +222,5 @@ REX_HOOK_RAW(sub_8241BF50) {
   tenchuz::frame_rate::OnSwap(base, ctx.r3.u32);
   tenchuz::OnGuestSwap();
   __imp__sub_8241BF50(ctx, base);
+  tenchuz::OnSwapEnd();
 }

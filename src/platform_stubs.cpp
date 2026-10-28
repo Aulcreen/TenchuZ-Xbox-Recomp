@@ -32,6 +32,8 @@ void Initialize(rex::Runtime*) {}
 bool PresentNative() { return false; }
 void TogglePresentNative() {}
 void RequestFrameDump() {}
+void RequestGpuProfile() {}
+void SetCacheDir(const std::filesystem::path&) {}
 void RequestScreenshot(const std::filesystem::path&) {}
 void OnSwap(uint8_t*, uint32_t) {}
 int LastFrameDepthDraws() { return -1; }
@@ -48,6 +50,7 @@ namespace tenchuz::debug_tools {
 void OnMainLoopFrame(uint8_t*) {}
 void SetOutputDir(const std::filesystem::path&) {}
 void RequestImageDump() {}
+void RequestFrameDumps(int) {}
 }  // namespace tenchuz::debug_tools
 
 namespace tenchuz {

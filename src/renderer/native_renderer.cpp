@@ -9,6 +9,8 @@
 
 #include "native_renderer.h"
 
+#include "../frame_stats.h"
+
 #include "../png_writer.h"
 
 #include "generated/default/tenchuz_pch.h"
@@ -65,7 +67,7 @@ REXCVAR_DEFINE_INT32(tenchuz_native_log_every, 0, "tenchuz",
 REXCVAR_DEFINE_BOOL(tenchuz_native_msaa, true, "tenchuz",
                     "Native render targets use the guest's MSAA sample count (RB_SURFACE_INFO)");
 REXCVAR_DEFINE_INT32(tenchuz_native_resolution_scale, 1, "tenchuz",
-                     "Internal resolution of native rendering, in multiples of the game's (1-4, at startup)");
+                     "Internal resolution of native rendering, in multiples of the game's (1-4)");
 REXCVAR_DEFINE_BOOL(tenchuz_native_log_presents, false, "tenchuz",
                     "Log every native frame end: the front buffer, when it was last resolved, and the frame's "
                     "draws, resolves and clears");
@@ -81,6 +83,13 @@ REXCVAR_DEFINE_INT32(tenchuz_native_msaa_samples, 0, "tenchuz",
 REXCVAR_DEFINE_STRING(tenchuz_native_post_effect, "none", "tenchuz",
                       "Native output post effect: none, fxaa, fxaa_extreme (the emulator's swap_post_effect)")
     .allowed({"none", "fxaa", "fxaa_extreme"});
+REXCVAR_DEFINE_DOUBLE(tenchuz_native_sharpening, 0.0, "tenchuz",
+                      "Contrast adaptive sharpening (AMD FidelityFX CAS) of the presented image: 0 = off, up to 1")
+    .range(0.0, 1.0);
+REXCVAR_DEFINE_BOOL(tenchuz_native_hardware_resolve, true, "tenchuz",
+                    "MSAA colour resolves that average every sample use the GPU's own resolve");
+REXCVAR_DEFINE_BOOL(tenchuz_native_depth32, true, "tenchuz",
+                    "Depth buffers are 32-bit float until the game uses stencil (else always depth + stencil)");
 REXCVAR_DEFINE_BOOL(tenchuz_dred, false, "tenchuz",
                     "Enable D3D12 DRED (auto-breadcrumbs, page faults) for GPU hang reports, without the debug layer");
 
@@ -109,6 +118,7 @@ constexpr uint32_t kDevCopyDestBase = 0x299C;       // RB_COPY_DEST_BASE
 constexpr uint32_t kDevCopyDestPitch = 0x29A0;      // RB_COPY_DEST_PITCH
 constexpr uint32_t kDevCopyDestInfo = 0x29A4;       // RB_COPY_DEST_INFO (only during Resolve, see OnD3DCall)
 constexpr uint32_t kApiResolve = 0x8241D770;        // D3DDevice_Resolve
+constexpr uint32_t kApiEndTiling = 0x8241CC58;      // D3DDevice_EndTiling
 constexpr uint32_t kDevDepthClear = 0x29AC;         // RB_DEPTH_CLEAR
 constexpr uint32_t kDevRenderTarget0 = 0x2F90;      // bound D3DSurface* RT0-3 (+4 each)
 constexpr uint32_t kDevDepthStencil = 0x2FA0;       // bound depth-stencil D3DSurface*
@@ -126,12 +136,17 @@ bool g_ready = false;
 // Host pixels per guest pixel on each axis of render targets and resolves
 // (--tenchuz_native_resolution_scale).
 uint32_t g_scale = 1;
+std::filesystem::path g_cache_dir;  // SetCacheDir: the pipeline cache's folder
 uint64_t g_frame = 0;
 int32_t g_log_frames = 0;
-std::unique_ptr<ShaderCache> g_shaders;
+// One shader cache per resolution scale (1-4), kept for switching back; the
+// draw path's pipelines are keyed by their translations, so they stay apart.
+std::array<std::unique_ptr<ShaderCache>, 5> g_shader_caches;
+ShaderCache* g_shaders = nullptr;  // the current scale's
 std::unique_ptr<DrawPath> g_draw_path;
 uint32_t g_frame_draws = 0, g_frame_draws_ready = 0;
 uint32_t g_frame_resolves = 0, g_frame_clears = 0;  // --tenchuz_native_log_presents
+uint32_t g_frame_resolves_skipped = 0;  // per-tile repeats (AlreadyResolved)
 std::map<uint64_t, uint32_t> g_draw_kinds;  // (API function, opcode, predicated) -> draws, logged frames
 
 // --- D3D12 plumbing ---------------------------------------------------------
@@ -163,6 +178,7 @@ ComPtr<ID3D12PipelineState> g_blit_pso;
 ComPtr<ID3D12PipelineState> g_resolve_pso;  // resolve with format conversion (same root as the blit)
 ComPtr<ID3D12PipelineState> g_resolve_msaa_pso;        // ... from a multisampled colour target
 ComPtr<ID3D12PipelineState> g_resolve_depth_msaa_pso;  // one sample of a multisampled depth buffer
+ComPtr<ID3D12PipelineState> g_resolve_depth_pso;       // a single-sampled depth buffer (or part of one)
 bool g_msaa_2x = false, g_msaa_4x = false;  // host support for every target format
 // FXAA on the presented image (--tenchuz_native_post_effect), like the SDK's
 // swap: the blit writes the image with its luma in alpha to g_fxaa_source,
@@ -172,9 +188,14 @@ ComPtr<ID3D12PipelineState> g_fxaa_pso, g_fxaa_extreme_pso;
 ComPtr<ID3D12Resource> g_fxaa_source;
 D3D12_RESOURCE_STATES g_fxaa_source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr DXGI_FORMAT kFxaaSourceFormat = DXGI_FORMAT_R16G16B16A16_UNORM;  // the SDK's
+// Sharpening (--tenchuz_native_sharpening) after the blit and FXAA: they
+// write g_cas_source, and CAS filters that into the presenter's output.
+ComPtr<ID3D12PipelineState> g_cas_pso;  // the blit's root signature
+ComPtr<ID3D12Resource> g_cas_source;
+D3D12_RESOURCE_STATES g_cas_source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 // Per frame slot: blit source SRV, blit destination UAV, FXAA source SRV and
-// FXAA destination UAV; then the resolves'.
-constexpr uint32_t kPresentDescriptors = 4;
+// FXAA destination UAV, CAS source SRV and destination UAV; then the resolves'.
+constexpr uint32_t kPresentDescriptors = 6;
 constexpr uint32_t kResolveDescriptors = 512;  // per frame slot, 2 per converting resolve
 std::array<uint32_t, kFramesInFlight> g_resolve_descriptors_used{};
 
@@ -192,6 +213,12 @@ struct Surface {
   uint32_t guest_bytes = 0;       // resolve destinations: the guest memory a resolve covers
   uint32_t id = 0;                // creation number (draw list diagnostics)
   uint32_t samples = 1;
+  // Render targets: draws and clears so far. Resolve destinations: what the
+  // last resolve copied (source, its writes then, and the copy's settings),
+  // so the per-tile repeats of a resolve in a tiled pass are copied once.
+  uint64_t writes = 0;
+  const void* resolved_from = nullptr;
+  uint64_t resolved_writes = 0, resolved_settings = 0;
   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
   D3D12_CPU_DESCRIPTOR_HANDLE view = {};  // RTV or DSV (render targets only)
 
@@ -271,9 +298,11 @@ bool CreateTexture(Surface& s, DXGI_FORMAT format, uint32_t width, uint32_t heig
   desc.Height = height * scale;
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
-  // Depth surfaces are typeless so their depth plane can be copied into an
-  // R32 texture for depth resolves (D32_FLOAT_S8X24 is planar in D3D12).
-  desc.Format = format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? DXGI_FORMAT_R32G8X24_TYPELESS : format;
+  // Depth surfaces are typeless so depth resolves can read them as R32_FLOAT
+  // (D32_FLOAT_S8X24 is planar in D3D12: its depth plane).
+  desc.Format = format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? DXGI_FORMAT_R32G8X24_TYPELESS
+                : format == DXGI_FORMAT_D32_FLOAT        ? DXGI_FORMAT_R32_TYPELESS
+                                                         : format;
   desc.SampleDesc.Count = samples;
   desc.Flags = depth ? D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                      : (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
@@ -375,6 +404,17 @@ Surface* ColorTarget(uint8_t* base, uint32_t index) {
   return &g_targets.emplace(key, std::move(s)).first->second;
 }
 
+// Depth buffers: the game's depth is 24-bit float (RB_DEPTH_INFO.depth_format
+// D24FS8), kept as 32-bit float. Stencil doubles every depth read and write
+// (D32_FLOAT_S8X24 is 64 bits a sample), and gameplay hasn't used it, so it's
+// added only once a draw asks for the stencil test (ApplyRenderSettings).
+bool g_depth_stencil = false;
+
+DXGI_FORMAT DepthFormat() {
+  return g_depth_stencil || !REXCVAR_GET(tenchuz_native_depth32) ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                                                  : DXGI_FORMAT_D32_FLOAT;
+}
+
 Surface* DepthTarget(uint8_t* base) {
   const uint32_t info = Dev(base, kDevDepthInfo);
   uint32_t width, height;
@@ -387,7 +427,7 @@ Surface* DepthTarget(uint8_t* base) {
     return &it->second;
   }
   Surface s;
-  if (!CreateTexture(s, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, width, height, true, false, false, samples, g_scale)) {
+  if (!CreateTexture(s, DepthFormat(), width, height, true, false, false, samples, g_scale)) {
     return nullptr;
   }
   SetDebugName(s.resource.Get(), fmt::format("tenchuz depth edram {:03X} {}x{} x{}", info & 0xFFF, s.host_width(),
@@ -472,6 +512,7 @@ void EndOp(uint32_t op) {
 
 void ClearColor(Surface& s, const float color[4]) {
   ++g_frame_clears;
+  ++s.writes;
   const uint32_t op = BeginOp("clear colour", s.width, s.height);
   Transition(s, D3D12_RESOURCE_STATE_RENDER_TARGET);
   g_list->ClearRenderTargetView(s.view, color, 0, nullptr);
@@ -479,7 +520,14 @@ void ClearColor(Surface& s, const float color[4]) {
 }
 
 void ClearDepth(Surface& s, float z, uint8_t stencil, D3D12_CLEAR_FLAGS flags) {
+  if (s.format == DXGI_FORMAT_D32_FLOAT) {
+    flags = D3D12_CLEAR_FLAGS(flags & ~D3D12_CLEAR_FLAG_STENCIL);
+    if (!flags) {
+      return;
+    }
+  }
   ++g_frame_clears;
+  ++s.writes;
   const uint32_t op = BeginOp("clear depth", s.width, s.height);
   Transition(s, D3D12_RESOURCE_STATE_DEPTH_WRITE);
   g_list->ClearDepthStencilView(s.view, flags, z, stencil, 0, nullptr);
@@ -495,6 +543,7 @@ struct PendingClear {
   Surface* depth = nullptr;
   float z = 0.0f;
   uint8_t stencil = 0;
+  D3D12_CLEAR_FLAGS depth_flags = D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL);
 };
 PendingClear g_pending_clear;
 
@@ -503,8 +552,7 @@ void FlushPendingClears() {
     ClearColor(*g_pending_clear.color, g_pending_clear.rgba);
   }
   if (g_pending_clear.depth) {
-    ClearDepth(*g_pending_clear.depth, g_pending_clear.z, g_pending_clear.stencil,
-               D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL));
+    ClearDepth(*g_pending_clear.depth, g_pending_clear.z, g_pending_clear.stencil, g_pending_clear.depth_flags);
   }
   g_pending_clear = {};
 }
@@ -532,27 +580,43 @@ using SerializeRootFn = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_R
 
 // Resolves from multisampled targets. `samples`: first sample (bits 0-1) and
 // how many are averaged (bits 2-4), from RB_COPY_CONTROL.copy_sample_select.
+// The resolve shaders copy a width x height area from src_at in the source to
+// dst_at in the destination (each packed x | y << 16): a Resolve's source
+// rectangle and destination point.
 constexpr char kResolveMsaaShader[] = R"(
 Texture2DMS<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
-cbuffer Params : register(b0) { uint width; uint height; float scale; uint samples; };
+cbuffer Params : register(b0) { uint width; uint height; float scale; uint samples; uint src_at; uint dst_at; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= width || id.y >= height) return;
+  int2 s = int2(id.xy) + int2(src_at & 0xFFFF, src_at >> 16);
   uint first = samples & 3, count = samples >> 2;
   float4 sum = 0;
-  for (uint i = 0; i < count; ++i) sum += src.Load(int2(id.xy), first + i);
-  dst[id.xy] = sum / float(count) * scale;
+  for (uint i = 0; i < count; ++i) sum += src.Load(s, first + i);
+  dst[id.xy + uint2(dst_at & 0xFFFF, dst_at >> 16)] = sum / float(count) * scale;
 }
 )";
 constexpr char kResolveDepthMsaaShader[] = R"(
 Texture2DMS<float> src : register(t0);
 RWTexture2D<float> dst : register(u0);
-cbuffer Params : register(b0) { uint width; uint height; float scale; uint samples; };
+cbuffer Params : register(b0) { uint width; uint height; float scale; uint samples; uint src_at; uint dst_at; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= width || id.y >= height) return;
-  dst[id.xy] = src.Load(int2(id.xy), samples & 3);
+  int2 s = int2(id.xy) + int2(src_at & 0xFFFF, src_at >> 16);
+  dst[id.xy + uint2(dst_at & 0xFFFF, dst_at >> 16)] = src.Load(s, samples & 3);
+}
+)";
+constexpr char kResolveDepthShader[] = R"(
+Texture2D<float> src : register(t0);
+RWTexture2D<float> dst : register(u0);
+cbuffer Params : register(b0) { uint width; uint height; float scale; uint samples; uint src_at; uint dst_at; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+  if (id.x >= width || id.y >= height) return;
+  int2 s = int2(id.xy) + int2(src_at & 0xFFFF, src_at >> 16);
+  dst[id.xy + uint2(dst_at & 0xFFFF, dst_at >> 16)] = src.Load(int3(s, 0));
 }
 )";
 
@@ -593,13 +657,43 @@ constexpr uint32_t kGammaRampBytes = 256 * 4;
 constexpr char kResolveShader[] = R"(
 Texture2D<float4> src : register(t0);
 RWTexture2D<float4> dst : register(u0);
-cbuffer Params : register(b0) { uint width; uint height; float scale; uint pad; };
+cbuffer Params : register(b0) { uint width; uint height; float scale; uint pad; uint src_at; uint dst_at; };
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
   if (id.x >= width || id.y >= height) return;
-  dst[id.xy] = src.Load(int3(id.xy, 0)) * scale;
+  int2 s = int2(id.xy) + int2(src_at & 0xFFFF, src_at >> 16);
+  dst[id.xy + uint2(dst_at & 0xFFFF, dst_at >> 16)] = src.Load(int3(s, 0)) * scale;
 }
 )";
+
+// Contrast adaptive sharpening, after AMD FidelityFX CAS (its non-scaling
+// path): each pixel is pushed away from its 4 neighbours by an amount that
+// shrinks where the 3x3 neighbourhood already has strong contrast, so edges
+// don't ring. peak is -1 / lerp(8, 5, sharpness).
+constexpr char kCasShader[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Params : register(b0) { uint width; uint height; float peak; };
+float3 At(int2 p) { return src.Load(int3(clamp(p, int2(0, 0), int2(width - 1, height - 1)), 0)).rgb; }
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+  if (id.x >= width || id.y >= height) return;
+  int2 p = int2(id.xy);
+  float3 a = At(p + int2(-1, -1)), b = At(p + int2(0, -1)), c = At(p + int2(1, -1));
+  float3 d = At(p + int2(-1, 0)), e = At(p), f = At(p + int2(1, 0));
+  float3 g = At(p + int2(-1, 1)), h = At(p + int2(0, 1)), i = At(p + int2(1, 1));
+  // Soft minimum and maximum: the cross plus the whole 3x3.
+  float3 mn = min(min(min(d, e), min(f, b)), h);
+  mn += min(mn, min(min(a, c), min(g, i)));
+  float3 mx = max(max(max(d, e), max(f, b)), h);
+  mx += max(mx, max(max(a, c), max(g, i)));
+  float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));
+  float3 w = amp * peak;
+  float3 color = saturate(((b + d + f + h) * w + e) / (1.0 + 4.0 * w));
+  dst[id.xy] = float4(color, 1.0);
+}
+)";
+constexpr uint32_t kCasConstants = 3;
 
 bool CreateBlit() {
   HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
@@ -690,8 +784,19 @@ bool CreateBlit() {
   if (FAILED(g_d3d->CreateComputePipelineState(&pso, IID_PPV_ARGS(&g_resolve_pso)))) {
     return false;
   }
+  ComPtr<ID3DBlob> cas_code;
+  if (SUCCEEDED(compile(kCasShader, sizeof(kCasShader) - 1, "cas", nullptr, nullptr, "main", "cs_5_0", 0, 0,
+                        &cas_code, &errors))) {
+    pso.CS = {cas_code->GetBufferPointer(), cas_code->GetBufferSize()};
+    g_d3d->CreateComputePipelineState(&pso, IID_PPV_ARGS(&g_cas_pso));
+  }
+  if (!g_cas_pso) {
+    REXLOG_WARN("tenchuz: native sharpening unavailable: {}",
+                errors ? static_cast<const char*>(errors->GetBufferPointer()) : "pipeline creation failed");
+  }
   for (auto [source, out] : {std::pair{kResolveMsaaShader, &g_resolve_msaa_pso},
-                             std::pair{kResolveDepthMsaaShader, &g_resolve_depth_msaa_pso}}) {
+                             std::pair{kResolveDepthMsaaShader, &g_resolve_depth_msaa_pso},
+                             std::pair{kResolveDepthShader, &g_resolve_depth_pso}}) {
     ComPtr<ID3DBlob> msaa_code;
     if (FAILED(compile(source, std::strlen(source), "resolve_msaa", nullptr, nullptr, "main", "cs_5_0", 0, 0,
                        &msaa_code, &errors))) {
@@ -709,7 +814,7 @@ bool CreateBlit() {
     bool supported = true;
     for (DXGI_FORMAT format : {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16_FLOAT,
                                DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                               DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
+                               DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_D32_FLOAT}) {
       D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels = {format, count};
       supported = supported && SUCCEEDED(g_d3d->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
                                                                     &levels, sizeof(levels))) &&
@@ -852,6 +957,25 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
       fxaa_pso = nullptr;
     }
   }
+  // Sharpening's source, likewise.
+  const float sharpening = float(std::clamp(REXCVAR_GET(tenchuz_native_sharpening), 0.0, 1.0));
+  bool cas = sharpening > 0.0f && g_cas_pso;
+  if (cas && g_cas_source) {
+    const D3D12_RESOURCE_DESC desc = g_cas_source->GetDesc();
+    if (desc.Width != width || desc.Height != height) {
+      slot.retired.push_back(std::move(g_cas_source));
+    }
+  }
+  if (cas && !g_cas_source) {
+    Surface cas_source;
+    if (CreateTexture(cas_source, kFxaaSourceFormat, width, height, false, false, true)) {
+      g_cas_source = std::move(cas_source.resource);
+      g_cas_source_state = cas_source.state;
+      SetDebugName(g_cas_source.Get(), "tenchuz sharpening source");
+    } else {
+      cas = false;
+    }
+  }
 
   slot.present_allocator->Reset();
   g_present_list->Reset(slot.present_allocator.Get(), nullptr);
@@ -865,9 +989,11 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
     return b;
   };
   Surface& source = *g_present_source;
-  // The blit writes the presenter's output, or FXAA's source.
-  ID3D12Resource* blit_dest = fxaa_pso ? g_fxaa_source.Get() : output;
-  D3D12_RESOURCE_BARRIER barriers[3];
+  // The blit writes the presenter's output, or FXAA's source, or sharpening's;
+  // FXAA writes the output or sharpening's source.
+  ID3D12Resource* filtered = cas ? g_cas_source.Get() : output;
+  ID3D12Resource* blit_dest = fxaa_pso ? g_fxaa_source.Get() : filtered;
+  D3D12_RESOURCE_BARRIER barriers[4];
   UINT barrier_count = 0;
   if (source.state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
     barriers[barrier_count++] =
@@ -881,10 +1007,15 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
         barrier(g_fxaa_source.Get(), g_fxaa_source_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_fxaa_source_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   }
+  if (cas && g_cas_source_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    barriers[barrier_count++] =
+        barrier(g_cas_source.Get(), g_cas_source_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_cas_source_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  }
   g_present_list->ResourceBarrier(barrier_count, barriers);
 
   // kPresentDescriptors per frame slot: blit source SRV and destination UAV,
-  // then FXAA source SRV and destination UAV.
+  // then FXAA's and sharpening's source SRV and destination UAV.
   const uint32_t first = uint32_t(g_frame % kFramesInFlight) * kPresentDescriptors;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_shader_heap->GetCPUDescriptorHandleForHeapStart();
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_shader_heap->GetGPUDescriptorHandleForHeapStart();
@@ -899,7 +1030,7 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
   srv.Texture2D.MipLevels = 1;
   g_d3d->CreateShaderResourceView(source.resource.Get(), &srv, cpu_at(0));
   D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
-  uav.Format = fxaa_pso ? kFxaaSourceFormat : rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+  uav.Format = (fxaa_pso || cas) ? kFxaaSourceFormat : rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
   uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
   g_d3d->CreateUnorderedAccessView(blit_dest, nullptr, &uav, cpu_at(1));
 
@@ -934,8 +1065,8 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
     g_fxaa_source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     srv.Format = kFxaaSourceFormat;
     g_d3d->CreateShaderResourceView(g_fxaa_source.Get(), &srv, cpu_at(2));
-    uav.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
-    g_d3d->CreateUnorderedAccessView(output, nullptr, &uav, cpu_at(3));
+    uav.Format = cas ? kFxaaSourceFormat : rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    g_d3d->CreateUnorderedAccessView(filtered, nullptr, &uav, cpu_at(3));
     g_present_list->SetComputeRootSignature(g_fxaa_root.Get());
     g_present_list->SetPipelineState(fxaa_pso);
     uint32_t fxaa_constants[4] = {width, height, 0, 0};
@@ -948,6 +1079,30 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
     g_present_list->Dispatch((width + 15) / 16, (height + 7) / 8, 1);
     if (g_draw_path) {
       g_draw_path->EndOp(fxaa_op);
+    }
+  }
+
+  if (cas) {
+    const D3D12_RESOURCE_BARRIER to_source = barrier(g_cas_source.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_present_list->ResourceBarrier(1, &to_source);
+    g_cas_source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    srv.Format = kFxaaSourceFormat;
+    g_d3d->CreateShaderResourceView(g_cas_source.Get(), &srv, cpu_at(4));
+    uav.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    g_d3d->CreateUnorderedAccessView(output, nullptr, &uav, cpu_at(5));
+    g_present_list->SetComputeRootSignature(g_blit_root.Get());
+    g_present_list->SetPipelineState(g_cas_pso.Get());
+    g_present_list->SetComputeRootDescriptorTable(0, gpu_at(4));
+    g_present_list->SetComputeRootShaderResourceView(2, g_gamma_upload->GetGPUVirtualAddress() + ramp_offset);
+    const float peak = -1.0f / (8.0f + (5.0f - 8.0f) * sharpening);
+    uint32_t cas_constants[kCasConstants] = {width, height, 0};
+    std::memcpy(&cas_constants[2], &peak, 4);
+    g_present_list->SetComputeRoot32BitConstants(1, kCasConstants, cas_constants, 0);
+    const uint32_t cas_op = g_draw_path ? g_draw_path->BeginOp(g_present_list.Get(), "present CAS", width, height) : 0;
+    g_present_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+    if (g_draw_path) {
+      g_draw_path->EndOp(cas_op);
     }
   }
 
@@ -1004,6 +1159,9 @@ bool RefreshGuestOutput(rex::ui::Presenter::GuestOutputRefreshContext& context) 
   const D3D12_RESOURCE_BARRIER output_back =
       barrier(output, output_state, rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
   g_present_list->ResourceBarrier(1, &output_back);
+  if (g_draw_path) {
+    g_draw_path->ResolveProfile(g_present_list.Get());
+  }
   g_present_list->Close();
 
   ID3D12CommandList* lists[] = {g_present_list.Get()};
@@ -1095,7 +1253,7 @@ bool IsInternalDraw(uint32_t api_function) {
   switch (api_function) {
     case 0x8241B308:  // ClearF
     case kApiResolve:
-    case 0x8241CC58:  // EndTiling
+    case kApiEndTiling:
     case 0x8241BBC0:
       return true;
     default:
@@ -1108,10 +1266,66 @@ bool IsInternalDraw(uint32_t api_function) {
 // and in tiled passes its packets go to per-tile blocks the observer can't
 // decode yet, so it's read from the device at the D3D calls Resolve makes.
 bool g_in_resolve = false;
+bool g_tiling = false;  // between BeginTiling and EndTiling
+std::string g_resolve_area;  // the Resolve call's source rectangle and destination point, for the log
+// The Resolve call's source rectangle (guest pixels; right/bottom 0 = the whole
+// target) and destination point.
+uint32_t g_rect_left = 0, g_rect_top = 0, g_rect_right = 0, g_rect_bottom = 0;
+uint32_t g_dest_x = 0, g_dest_y = 0;
+
+// The area a resolve copies, in host pixels of `src` (scaled like it), and
+// whether it's the whole of both surfaces.
+struct ResolveArea {
+  uint32_t src_x = 0, src_y = 0, dst_x = 0, dst_y = 0, width = 0, height = 0;
+  bool whole = true;
+  uint32_t src_at() const { return src_x | (src_y << 16); }
+  uint32_t dst_at() const { return dst_x | (dst_y << 16); }
+  uint64_t key() const { return uint64_t(src_at()) | (uint64_t(dst_at()) << 32); }
+};
+
+// Clipped to the source and to a destination of dst_width x dst_height (guest pixels).
+ResolveArea GetResolveArea(const Surface& src, uint32_t dst_width, uint32_t dst_height) {
+  ResolveArea a;
+  uint32_t left = 0, top = 0, right = src.width, bottom = src.height;
+  if (g_rect_right > g_rect_left && g_rect_bottom > g_rect_top) {
+    left = std::min(g_rect_left, src.width);
+    top = std::min(g_rect_top, src.height);
+    right = std::min(g_rect_right, src.width);
+    bottom = std::min(g_rect_bottom, src.height);
+  }
+  // In a tiled pass the untiled target is complete before its tiles are
+  // resolved (the clears between tiles wait, see OnClear), so a tile's part
+  // copied to the same place is the whole target, copied once; the other
+  // tiles' parts then match it and are skipped (AlreadyResolved).
+  if (g_tiling && left == g_dest_x && top == g_dest_y) {
+    left = top = 0;
+    right = src.width;
+    bottom = src.height;
+    g_dest_x = g_dest_y = 0;
+  }
+  const uint32_t dx = std::min(g_dest_x, dst_width), dy = std::min(g_dest_y, dst_height);
+  const uint32_t w = std::min(right - left, dst_width - dx), h = std::min(bottom - top, dst_height - dy);
+  const uint32_t s = src.scale;
+  a.src_x = left * s;
+  a.src_y = top * s;
+  a.dst_x = dx * s;
+  a.dst_y = dy * s;
+  a.width = w * s;
+  a.height = h * s;
+  a.whole = left == 0 && top == 0 && dx == 0 && dy == 0 && w == std::min(src.width, dst_width) &&
+            h == std::min(src.height, dst_height);
+  return a;
+}
 uint32_t g_copy_dest_info = 0;
 uint32_t g_copy_control = 0;  // RB_COPY_CONTROL, the same way
 
 void OnD3DCall(uint32_t function, uint8_t* base) {
+  if (function == 0x8241BDE0) {  // SynchronizeToPresentationInterval: the frame's work is done
+    tenchuz::OnPresentWait();
+  }
+  if (function == kApiEndTiling) {
+    g_tiling = false;
+  }
   if (g_in_resolve && function != kApiResolve && g_device) {
     if (const uint32_t info = Dev(base, kDevCopyDestInfo)) {
       g_copy_dest_info = info;
@@ -1172,6 +1386,7 @@ void OnLiveDraw(const pm4::DrawInfo& draw, const pm4::Decoder& state, uint8_t* b
   for (uint32_t i = 0; i < 4; ++i) {
     target.rtvs[i] = g_null_rtv;
     if (colors[i]) {
+      ++colors[i]->writes;
       Transition(*colors[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
       target.color_formats[i] = colors[i]->format;
       target.rtvs[i] = colors[i]->view;
@@ -1182,6 +1397,7 @@ void OnLiveDraw(const pm4::DrawInfo& draw, const pm4::Decoder& state, uint8_t* b
     }
   }
   if (depth) {
+    ++depth->writes;
     Transition(*depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
     target.depth_format = depth->format;
     target.dsv = depth->view;
@@ -1191,6 +1407,9 @@ void OnLiveDraw(const pm4::DrawInfo& draw, const pm4::Decoder& state, uint8_t* b
     target.resolution_scale = depth->scale;
   }
   g_draw_path->Draw(g_list.Get(), draw, state, base, g_device, shaders, target, &g_frame_host);
+  if (!g_depth_stencil && g_draw_path->TakeStencilMissing()) {
+    g_depth_stencil = true;  // depth buffers get stencil from the next frame (ApplyRenderSettings)
+  }
 }
 
 // Process and GPU memory (QueryVideoMemoryInfo is per process).
@@ -1394,6 +1613,67 @@ void SaveScreenshot(Surface& s, const std::filesystem::path& path) {
   REXLOG_INFO("tenchuz: screenshot frame {} -> {}{}", g_frame, path.string(), ok ? "" : " (failed)");
 }
 
+// A changed resolution scale or MSAA count, between frames: the render
+// targets and resolve destinations are made again at the new size and sample
+// count (the game draws and resolves them anew each frame), with that
+// scale's shader cache (and pipelines, made the first time it's used).
+Surface g_kept_present;  // what the presenter still shows, until the next present
+uint32_t g_applied_msaa = 0;
+bool g_applied_stencil = false;
+
+void ApplyRenderSettings() {
+  const uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(tenchuz_native_resolution_scale), 1, 4));
+  const uint32_t msaa = REXCVAR_GET(tenchuz_native_msaa_samples) >= 4 ? 4 : 0;
+  if (scale == g_scale && msaa == g_applied_msaa && g_depth_stencil == g_applied_stencil) {
+    return;
+  }
+  WaitForFence(g_fence_counter, "render settings change");
+  if (g_present_source) {
+    g_kept_present = std::move(*g_present_source);
+    g_present_source = &g_kept_present;
+  }
+  g_pending_clear = {};
+  g_final_target = nullptr;
+  g_resolve_sources.clear();
+  g_latest_texture.clear();
+  g_textures.clear();
+  g_targets.clear();
+  if (scale != g_scale) {
+    g_scale = scale;
+    if (!g_shader_caches[g_scale]) {
+      g_shader_caches[g_scale] = std::make_unique<ShaderCache>(g_provider->GetAdapterVendorID(), g_scale);
+    }
+    g_shaders = g_shader_caches[g_scale].get();
+  }
+  g_applied_msaa = msaa;
+  g_applied_stencil = g_depth_stencil;
+  REXLOG_INFO("tenchuz: native resolution scale {}x, MSAA {}, depth {}", g_scale,
+              msaa ? (g_msaa_4x ? "4x" : "4x unsupported by this GPU") : "the game's",
+              g_depth_stencil ? "with stencil (the game used it)" : "32-bit");
+}
+
+// How long frames stay on screen, in display refreshes, while the game's
+// vblanks follow the display's: each frame is counted from the display vblank
+// it's handed over in to the next frame's. Logged every 600 frames; at 60 fps
+// on a 180 Hz display every frame should stay 3.
+
+void CountShownFor() {
+  static uint64_t last = 0;
+  static uint32_t counts[6] = {};  // 1..5 refreshes, 6+
+  static uint32_t frames = 0;
+  const uint64_t now = native::DisplayVblanks();
+  if (now && last && now > last) {
+    ++counts[std::min<uint64_t>(now - last, 6) - 1];
+    if (++frames == 600) {
+      REXLOG_INFO("tenchuz: NATIVE frames shown for 1/2/3/4/5/6+ refreshes: {}/{}/{}/{}/{}/{}", counts[0],
+                  counts[1], counts[2], counts[3], counts[4], counts[5]);
+      frames = 0;
+      std::fill(std::begin(counts), std::end(counts), 0);
+    }
+  }
+  last = now;
+}
+
 void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, bool present) {
   ID3D12CommandQueue* queue = g_provider->GetDirectQueue();
   if (g_recording) {
@@ -1448,12 +1728,19 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
   {
     // Frames slowed by new shaders: translation and pipeline creation.
     static double translated_before = 0;
+    static const ShaderCache* stats_cache = nullptr;
+    if (stats_cache != g_shaders) {  // a resolution scale change: that cache's own total
+      stats_cache = g_shaders;
+      translated_before = g_shaders ? g_shaders->stats().translate_ms : 0;
+    }
     const double translated = g_shaders ? g_shaders->stats().translate_ms : 0;
     const double translate_ms = translated - translated_before;
     translated_before = translated;
     if (translate_ms + draw_stats.pipeline_ms >= 4.0) {
-      REXLOG_INFO("tenchuz: NATIVE frame {}: {:.1f} ms translating shaders, {} pipelines in {:.1f} ms", g_frame,
-                  translate_ms, draw_stats.pipelines_created, draw_stats.pipeline_ms);
+      REXLOG_INFO("tenchuz: NATIVE frame {}: {:.1f} ms translating shaders, {} pipelines ({} from the cache) in "
+                  "{:.1f} ms",
+                  g_frame, translate_ms, draw_stats.pipelines_created, draw_stats.pipelines_loaded,
+                  draw_stats.pipeline_ms);
     }
   }
   if (draw_stats.stale_pages) {  // --tenchuz_native_recheck_pages
@@ -1510,14 +1797,15 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
   g_draw_kinds.clear();
   if (REXCVAR_GET(tenchuz_native_log_presents)) {
     const Surface* shown = it != g_latest_texture.end() ? it->second : nullptr;
-    REXLOG_INFO("tenchuz: NATIVE frame {} {} {:08X}: {}; {} draws ({} issued), {} resolves, {} clears", g_frame,
-                present ? "present" : "end", front_buffer,
+    REXLOG_INFO("tenchuz: NATIVE frame {} {} {:08X}: {}; {} draws ({} issued), {} resolves ({} repeats skipped), "
+                "{} clears",
+                g_frame, present ? "present" : "end", front_buffer,
                 shown ? fmt::format("resolved {} frames ago", g_frame - shown->resolved_frame)
                       : std::string("not resolved natively"),
-                g_frame_draws, draw_stats.issued, g_frame_resolves, g_frame_clears);
+                g_frame_draws, draw_stats.issued, g_frame_resolves, g_frame_resolves_skipped, g_frame_clears);
   }
   g_frame_draws = g_frame_draws_ready = 0;
-  g_frame_resolves = g_frame_clears = 0;
+  g_frame_resolves = g_frame_clears = g_frame_resolves_skipped = 0;
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE {} front buffer {:08X} {}x{}: {}", present ? "present" : "frame end",
                 front_buffer, width, height,
@@ -1536,6 +1824,7 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
     uint32_t aspect_x, aspect_y;
     widescreen::AspectFraction(aspect_x, aspect_y);
     g_presenter->RefreshGuestOutput(width * scale, height * scale, aspect_x, aspect_y, RefreshGuestOutput);
+    CountShownFor();
   }
   FrameSlot& slot = g_slots[g_frame % kFramesInFlight];
   slot.fence_value = ++g_fence_counter;
@@ -1544,6 +1833,7 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
     --g_log_frames;
   }
   ++g_frame;
+  ApplyRenderSettings();
   // --tenchuz_native_trace_syncs_at: the command-stream decoding of the next frame.
   const int32_t trace_at = REXCVAR_GET(tenchuz_native_trace_syncs_at);
   const bool trace = trace_at > 0 && g_frame >= uint64_t(trace_at) &&
@@ -1762,13 +2052,20 @@ void Initialize(rex::Runtime* runtime) {
     if (g_scale > 1) {
       REXLOG_INFO("tenchuz: native resolution scale {}x", g_scale);
     }
-    if (REXCVAR_GET(tenchuz_native_msaa_samples) >= 4) {
+    g_applied_msaa = REXCVAR_GET(tenchuz_native_msaa_samples) >= 4 ? 4 : 0;
+    if (g_applied_msaa) {
       REXLOG_INFO("tenchuz: native MSAA: 4x for the game's multisampled targets{}",
                   g_msaa_4x ? "" : " unsupported by this GPU");
     }
-    g_shaders = std::make_unique<ShaderCache>(g_provider->GetAdapterVendorID(), g_scale);
+    g_shader_caches[g_scale] = std::make_unique<ShaderCache>(g_provider->GetAdapterVendorID(), g_scale);
+    g_shaders = g_shader_caches[g_scale].get();
     g_draw_path = std::make_unique<DrawPath>();
-    if (!g_draw_path->Initialize(g_d3d, runtime->memory())) {
+    if (g_draw_path->Initialize(g_d3d, runtime->memory(),
+                                g_cache_dir.empty() ? std::filesystem::path() : g_cache_dir / "tenchuz_pipelines.bin")) {
+      UINT64 frequency = 0;
+      g_provider->GetDirectQueue()->GetTimestampFrequency(&frequency);
+      g_draw_path->SetTimestampFrequency(frequency);
+    } else {
       REXLOG_WARN("tenchuz: native draw path unavailable (D3D12 resource creation failed)");
       g_draw_path.reset();
     }
@@ -1790,6 +2087,14 @@ void RequestScreenshot(const std::filesystem::path& path) {
   std::lock_guard lock(g_screenshot_mutex);
   g_screenshot_path = path;
 }
+
+void RequestGpuProfile() {
+  if (g_draw_path) {
+    g_draw_path->RequestProfile();
+  }
+}
+
+void SetCacheDir(const std::filesystem::path& dir) { g_cache_dir = dir; }
 
 void RequestFrameDump() {
   g_dump_requested.store(true);
@@ -1847,6 +2152,33 @@ void OnClear(uint8_t* base, uint32_t flags, uint32_t color_ptr, double z, uint32
   }
   BeginRecording();
   FlushPendingClears();
+  // In a tiled pass the game resolves each tile's part of a target (a source
+  // rectangle) and clears between tiles; the hardware draws the next tile into
+  // the cleared EDRAM before resolving it. We render once, untiled, so such a
+  // clear would wipe the parts still to be resolved (the shadow map's right
+  // half). Clears there wait for the next draw or clear.
+  if (g_tiling) {
+    if ((flags & 0xF) && Dev(base, kDevRenderTarget0)) {
+      if (Surface* s = ColorTarget(base, 0)) {
+        g_pending_clear.color = s;
+        ClearColorArgument(base, color_ptr, g_pending_clear.rgba);
+      }
+    }
+    if (flags & 0x30) {
+      if (Surface* d = DepthTarget(base)) {
+        g_pending_clear.depth = d;
+        g_pending_clear.z = float(std::clamp(z, 0.0, 1.0));
+        g_pending_clear.stencil = uint8_t(stencil);
+        g_pending_clear.depth_flags = D3D12_CLEAR_FLAGS(((flags & 0x10) ? D3D12_CLEAR_FLAG_DEPTH : 0) |
+                                                        ((flags & 0x20) ? D3D12_CLEAR_FLAG_STENCIL : 0));
+      }
+    }
+    if (Logging()) {
+      REXLOG_INFO("tenchuz: NATIVE clear flags {:X} in a tiled pass from {:08X}: waits for the next draw", flags,
+                  caller);
+    }
+    return;
+  }
   if (Logging()) {
     DumpObject(base, "RT0 surface", Dev(base, kDevRenderTarget0));
     DumpObject(base, "depth surface", Dev(base, kDevDepthStencil));
@@ -1878,8 +2210,8 @@ void OnClear(uint8_t* base, uint32_t flags, uint32_t color_ptr, double z, uint32
     if (Surface* s = DepthTarget(base)) {
       ClearDepth(*s, float(std::clamp(z, 0.0, 1.0)), uint8_t(stencil), ds);
       if (Logging()) {
-        REXLOG_INFO("tenchuz: NATIVE clear depth edram {:03X} {}x{} z {:.3f}",
-                    Dev(base, kDevDepthInfo) & 0xFFF, s->width, s->height, z);
+        REXLOG_INFO("tenchuz: NATIVE clear depth edram {:03X} {}x{} z {:.3f} from {:08X} in {:08X}",
+                    Dev(base, kDevDepthInfo) & 0xFFF, s->width, s->height, z, caller, gpu_observer::TopFunction());
       }
     }
   }
@@ -1936,9 +2268,37 @@ void OnBeginTiling(uint8_t* base, uint32_t count, uint32_t rects) {
     g_bound_width = right;
     g_bound_height = bottom;
   }
+  g_tiling = count > 1;
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE begin tiling {} tiles -> {}x{}", count, right, bottom);
   }
+}
+
+// Whether the GPU can MSAA-resolve `format` itself (cached per format).
+bool HardwareResolvable(DXGI_FORMAT format) {
+  static std::unordered_map<uint32_t, bool> known;
+  auto [it, added] = known.try_emplace(uint32_t(format), false);
+  if (added) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {format};
+    it->second = SUCCEEDED(g_d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+                 (support.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RESOLVE);
+  }
+  return it->second;
+}
+
+// Whether `dst` already holds this resolve: a tiled pass resolves once per
+// tile, and the untiled target we render is copied whole each time, so the
+// repeats (same frame, same source unchanged since, same settings) are
+// skipped. Records the resolve otherwise.
+bool AlreadyResolved(Surface& dst, const Surface& src, uint64_t settings) {
+  if (dst.resolved_frame == g_frame && dst.resolved_from == &src && dst.resolved_writes == src.writes &&
+      dst.resolved_settings == settings) {
+    return true;
+  }
+  dst.resolved_from = &src;
+  dst.resolved_writes = src.writes;
+  dst.resolved_settings = settings;
+  return false;
 }
 
 // The samples a resolve of `src` reads (RB_COPY_CONTROL.copy_sample_select,
@@ -1964,7 +2324,8 @@ uint32_t ResolveSamples(const Surface& src, uint32_t guest_samples) {
 // A resolve done by a compute pass (format conversion, exponent bias, or a
 // multisampled source): `src` read through an SRV, `dst` written through a UAV.
 bool ResolveCompute(Surface& src, DXGI_FORMAT srv_format, Surface& dst, DXGI_FORMAT uav_format,
-                    ID3D12PipelineState* pso, uint32_t width, uint32_t height, float scale, uint32_t samples) {
+                    ID3D12PipelineState* pso, uint32_t width, uint32_t height, float scale, uint32_t samples,
+                    uint32_t src_at = 0, uint32_t dst_at = 0) {
   uint32_t& used = g_resolve_descriptors_used[g_frame % kFramesInFlight];
   if (!pso || used + 2 > kResolveDescriptors) {
     return false;
@@ -1998,9 +2359,9 @@ bool ResolveCompute(Surface& src, DXGI_FORMAT srv_format, Surface& dst, DXGI_FOR
   g_list->SetComputeRootSignature(g_blit_root.Get());
   g_list->SetPipelineState(pso);
   g_list->SetComputeRootDescriptorTable(0, gpu);
-  uint32_t constants[4] = {width, height, 0, samples};
+  uint32_t constants[6] = {width, height, 0, samples, src_at, dst_at};
   std::memcpy(&constants[2], &scale, 4);
-  g_list->SetComputeRoot32BitConstants(1, 4, constants, 0);
+  g_list->SetComputeRoot32BitConstants(1, 6, constants, 0);
   g_list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
   return true;
 }
@@ -2017,12 +2378,12 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
   const bool msaa = src->samples > 1;
   const uint64_t key = TextureKey(dest, src->width, src->height);
   Surface& dst = g_textures[key];
-  if (!dst.resource || dst.format != DXGI_FORMAT_R32_TYPELESS || (msaa && !dst.unordered_access)) {
+  if (!dst.resource || dst.format != DXGI_FORMAT_R32_TYPELESS || !dst.unordered_access) {
     if (dst.resource) {
       g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(dst.resource));
     }
     dst = Surface();
-    if (!CreateTexture(dst, DXGI_FORMAT_R32_TYPELESS, src->width, src->height, false, false, msaa, 1, src->scale)) {
+    if (!CreateTexture(dst, DXGI_FORMAT_R32_TYPELESS, src->width, src->height, false, false, true, 1, src->scale)) {
       if (g_latest_texture[dest] == &dst) {
         g_latest_texture.erase(dest);
       }
@@ -2034,26 +2395,27 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
   }
   g_latest_texture[dest] = &dst;
   dst.red_blue_swapped = false;
+  const uint32_t samples = ResolveSamples(*src, GuestSampleCount(base));
+  const ResolveArea area = GetResolveArea(*src, src->width, src->height);
+  if (AlreadyResolved(dst, *src, samples ^ (area.key() << 8))) {
+    ++g_frame_resolves_skipped;
+    return;
+  }
   dst.resolved_frame = g_frame;
   dst.guest_bytes = ((src->width + 31) & ~31u) * ((src->height + 31) & ~31u) * 4;
   ++g_frame_resolves;
   const uint32_t op = BeginOp("resolve depth", dest, (src->width << 16) | src->height);
-  bool done = true;
-  if (msaa) {
-    done = ResolveCompute(*src, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, dst, DXGI_FORMAT_R32_FLOAT,
-                          g_resolve_depth_msaa_pso.Get(), src->host_width(), src->host_height(), 1.0f,
-                          ResolveSamples(*src, GuestSampleCount(base)) & 3);
-  } else {
-    Transition(*src, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST);
-    D3D12_TEXTURE_COPY_LOCATION to = {dst.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    D3D12_TEXTURE_COPY_LOCATION from = {src->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    g_list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
-  }
+  // A compute pass either way: depth-stencil copies can't take a box.
+  const bool done = ResolveCompute(*src,
+                                   src->format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_FLOAT
+                                                                         : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                                   dst, DXGI_FORMAT_R32_FLOAT,
+                                   msaa ? g_resolve_depth_msaa_pso.Get() : g_resolve_depth_pso.Get(), area.width,
+                                   area.height, 1.0f, samples & 3, area.src_at(), area.dst_at());
   EndOp(op);
   if (Logging()) {
-    REXLOG_INFO("tenchuz: NATIVE resolve flags {:X} depth {}x{} x{} -> {:08X}{} (copy control {:08X})", flags,
-                src->width, src->height, src->samples, dest, done ? "" : " skipped", g_copy_control);
+    REXLOG_INFO("tenchuz: NATIVE resolve flags {:X} depth {}x{} x{} -> {:08X}{}{} (copy control {:08X})", flags,
+                src->width, src->height, src->samples, dest, g_resolve_area, done ? "" : " skipped", g_copy_control);
   }
 }
 
@@ -2061,7 +2423,23 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
 // 0x100 / 0x200 clear the render target / depth-stencil afterwards. The source
 // comes from the flags because in tiled passes the device's RB_COPY_CONTROL
 // shadow is not updated per call (a depth resolve showed render target 0).
-void OnResolveStart() {
+void OnResolveStart(uint8_t* base, uint32_t source_rect, uint32_t dest_point) {
+  g_resolve_area.clear();
+  g_rect_left = source_rect ? REX_LOAD_U32(source_rect) : 0;
+  g_rect_top = source_rect ? REX_LOAD_U32(source_rect + 4) : 0;
+  g_rect_right = source_rect ? REX_LOAD_U32(source_rect + 8) : 0;
+  g_rect_bottom = source_rect ? REX_LOAD_U32(source_rect + 12) : 0;
+  g_dest_x = dest_point ? REX_LOAD_U32(dest_point) : 0;
+  g_dest_y = dest_point ? REX_LOAD_U32(dest_point + 4) : 0;
+  if (Logging()) {
+    if (source_rect) {
+      g_resolve_area += fmt::format(" rect {},{}-{},{}", REX_LOAD_U32(source_rect), REX_LOAD_U32(source_rect + 4),
+                                    REX_LOAD_U32(source_rect + 8), REX_LOAD_U32(source_rect + 12));
+    }
+    if (dest_point) {
+      g_resolve_area += fmt::format(" at {},{}", REX_LOAD_U32(dest_point), REX_LOAD_U32(dest_point + 4));
+    }
+  }
   g_in_resolve = true;
   g_copy_dest_info = 0;
   g_copy_control = 0;
@@ -2096,6 +2474,7 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
       g_pending_clear.depth = d;
       g_pending_clear.z = float(std::clamp(clear_z, 0.0, 1.0));
       g_pending_clear.stencil = uint8_t(Dev(base, kDevDepthClear));  // RB_DEPTH_CLEAR: stencil in bits 0-7
+      g_pending_clear.depth_flags = D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL);
     }
   }
   if (source_select == 4) {
@@ -2121,6 +2500,9 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
   // A compute pass converts, scales, or reads a multisampled source; else a
   // plain copy.
   const bool convert = dest_format != src->format || exp_bias != 0 || src->samples > 1;
+  // Except a plain average of every sample: the GPU's own MSAA resolve.
+  const bool hardware_resolve = REXCVAR_GET(tenchuz_native_hardware_resolve) && src->samples > 1 &&
+                               dest_format == src->format && exp_bias == 0 && HardwareResolvable(src->format);
   const uint64_t key = TextureKey(dest, copy_width, copy_height);
   Surface& dst = g_textures[key];
   if (!dst.resource || dst.format != dest_format || (convert && !dst.unordered_access)) {
@@ -2144,31 +2526,45 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
   }
   g_latest_texture[dest] = &dst;
   g_resolve_sources[dest] = src;
+  const uint32_t samples = ResolveSamples(*src, GuestSampleCount(base));
+  const ResolveArea area = GetResolveArea(*src, copy_width, copy_height);
+  if (AlreadyResolved(dst, *src,
+                      (uint64_t(samples) | (uint64_t(uint32_t(exp_bias) & 0x3F) << 8) |
+                       (uint64_t(dest_format) << 16) | (uint64_t((dest_info >> 24) & 1) << 32)) ^
+                          (area.key() * 0x9E3779B97F4A7C15ull))) {
+    ++g_frame_resolves_skipped;
+    return;
+  }
   dst.resolved_frame = g_frame;
   dst.guest_bytes = ((dest_width + 31) & ~31u) * ((dest_height + 31) & ~31u) * BytesPerPixel(dest_format);
   ++g_frame_resolves;
   dst.red_blue_swapped = (dest_info >> 24) & 1;
   const uint32_t op = BeginOp("resolve copy", dest, (dest_width << 16) | dest_height);
   bool done = true;
-  if (convert) {
+  if (hardware_resolve && (samples >> 2) == src->samples && (samples & 3) == 0 && area.whole &&
+      dst.host_width() == src->host_width() && dst.host_height() == src->host_height()) {
+    Transition(*src, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+    Transition(dst, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+    g_list->ResolveSubresource(dst.resource.Get(), 0, src->resource.Get(), 0, src->format);
+  } else if (convert) {
     // A cross-format copy would be invalid: skipped when there's no pass.
     done = ResolveCompute(*src, src->format, dst, dest_format,
-                          src->samples > 1 ? g_resolve_msaa_pso.Get() : g_resolve_pso.Get(), dst.host_width(),
-                          dst.host_height(), std::ldexp(1.0f, exp_bias), ResolveSamples(*src, GuestSampleCount(base)));
+                          src->samples > 1 ? g_resolve_msaa_pso.Get() : g_resolve_pso.Get(), area.width,
+                          area.height, std::ldexp(1.0f, exp_bias), samples, area.src_at(), area.dst_at());
   } else {
     Transition(*src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION to = {dst.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     D3D12_TEXTURE_COPY_LOCATION from = {src->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
-    D3D12_BOX box = {0, 0, 0, dst.host_width(), dst.host_height(), 1};
-    g_list->CopyTextureRegion(&to, 0, 0, 0, &from, &box);
+    D3D12_BOX box = {area.src_x, area.src_y, 0, area.src_x + area.width, area.src_y + area.height, 1};
+    g_list->CopyTextureRegion(&to, area.dst_x, area.dst_y, 0, &from, &box);
   }
   EndOp(op);
   if (Logging()) {
-    REXLOG_INFO("tenchuz: NATIVE resolve flags {:X} RT{} {}x{} x{} fmt {} -> {:08X} {}x{} fmt {} bias {}{}{}{}{}{} "
+    REXLOG_INFO("tenchuz: NATIVE resolve flags {:X} RT{} {}x{} x{} fmt {} -> {:08X} {}x{} fmt {} bias {}{}{}{}{}{}{} "
                 "(dest info {:08X}, copy control {:08X})",
                 flags, source_select, src->width, src->height, src->samples, int(src->format), dest, dest_width,
-                dest_height, int(dest_format), exp_bias, convert ? " (compute)" : "", done ? "" : " skipped",
+                dest_height, int(dest_format), exp_bias, g_resolve_area, convert ? " (compute)" : "", done ? "" : " skipped",
                 dst.red_blue_swapped ? " +swap" : "", (flags & 0x100) ? " +clear colour" : "",
                 (flags & 0x200) ? " +clear depth" : "", dest_info, g_copy_control);
   }
@@ -2227,7 +2623,9 @@ REX_HOOK_RAW(sub_8241D770) {
   const uint32_t flags = ctx.r4.u32;
   const uint32_t clear_color = ctx.r10.u32;  // const D3DVECTOR4*
   const double clear_z = ctx.f1.f64;
-  tenchuz::native::OnResolveStart();
+  const uint32_t source_rect = ctx.r5.u32;  // const D3DRECT*, null for the whole target
+  const uint32_t dest_point = ctx.r7.u32;   // const D3DPOINT*, null for (0, 0)
+  tenchuz::native::OnResolveStart(base, source_rect, dest_point);
   {
     tenchuz::HookScope scope(0x8241D770, ctx, base);
     __imp__sub_8241D770(ctx, base);

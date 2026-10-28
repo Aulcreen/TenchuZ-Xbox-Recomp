@@ -131,6 +131,7 @@ class TenchuzApp : public rex::ReXApp {
     tenchuz::gpu_observer::SetOutputDir(paths.user_data_root / "traces");
     tenchuz::profiler::SetOutputDir(paths.user_data_root / "traces");
     tenchuz::debug_tools::SetOutputDir(paths.user_data_root / "traces");
+    tenchuz::native::SetCacheDir(paths.user_data_root / "cache");
   }
 
 #if defined(__APPLE__)
@@ -171,6 +172,8 @@ class TenchuzApp : public rex::ReXApp {
   }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    // The window: the game's name, not the SDK's "<app> [rexglue-<version>]".
+    if (window()) window()->SetTitle("Tenchu Z");
     // Esc: the game menu. Its settings go to tenchuz.toml next to the exe,
     // which the SDK loads at startup (command-line flags still win).
     tenchuz::game_menu::Install(drawer, window(), settings_path_);

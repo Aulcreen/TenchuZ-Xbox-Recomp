@@ -13,4 +13,8 @@ namespace tenchuz {
 
 rex::ui::FrameStats GetFrameStats();
 
+// The game's wait for the presentation interval (SynchronizeToPresentationInterval):
+// the end of its work on a frame, for the frame-time log.
+void OnPresentWait();
+
 }  // namespace tenchuz

@@ -39,10 +39,14 @@ foreach ($dll in @("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll
 }
 
 Copy-Item (Join-Path $PSScriptRoot "release\README.txt") $stage
+# The version Windows' installed apps list shows (Setup registers it).
+Set-Content -Path (Join-Path $stage "version.txt") -Value $version -Encoding ascii -NoNewline
 
 $installer = Join-Path $dist "TenchuZ-Setup-$version.exe"
 if (Test-Path $installer) { Remove-Item -Force $installer }
-& (Join-Path $build "Setup.exe") --pack $stage $installer
-if ($LASTEXITCODE -ne 0) { throw "Setup.exe --pack failed ($LASTEXITCODE)" }
+# Setup.exe is a windowed program: wait for it explicitly.
+$pack = Start-Process -FilePath (Join-Path $build "Setup.exe") -ArgumentList "--pack", "`"$stage`"", "`"$installer`"" `
+  -NoNewWindow -Wait -PassThru
+if ($pack.ExitCode -ne 0) { throw "Setup.exe --pack failed ($($pack.ExitCode))" }
 $size = [math]::Round((Get-Item $installer).Length / 1MB, 1)
 "Packaged $name ($($files.Count + 5) files) -> $installer ($size MB)"

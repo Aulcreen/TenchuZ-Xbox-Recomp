@@ -27,6 +27,50 @@ namespace {
 
 constexpr uint32_t kAspectConstant = 0x8200B73C;  // 16/9, .rdata
 constexpr uint32_t kAspect16x9Bits = 0x3FE38E39;
+// Copies the game takes at startup: the display aspect (sub_822A6AE8 writes
+// it, sub_822A6C30 reads it) and the camera block's (0x8340BD40 + 8), which
+// the projection (sub_823E1128) takes as its aspect every frame.
+constexpr uint32_t kDisplayAspect = 0x829BF1B4;
+constexpr uint32_t kCameraAspect = 0x8340BD48;
+
+uint32_t g_applied_bits = kAspect16x9Bits;  // the aspect the game image holds
+
+uint32_t Load(const uint8_t* host) {
+  return (uint32_t(host[0]) << 24) | (uint32_t(host[1]) << 16) | (uint32_t(host[2]) << 8) | host[3];
+}
+
+void Store(uint8_t* host, uint32_t bits) {
+  host[0] = uint8_t(bits >> 24);
+  host[1] = uint8_t(bits >> 16);
+  host[2] = uint8_t(bits >> 8);
+  host[3] = uint8_t(bits);
+}
+
+// The constant is in read-only .rdata.
+void StoreConstant(uint8_t* host, uint32_t bits) {
+#if defined(_WIN32)
+  DWORD old_protect = 0;
+  const bool unprotected = VirtualProtect(host, 4, PAGE_READWRITE, &old_protect);
+#else
+  rex::memory::PageAccess old_access = rex::memory::PageAccess::kReadOnly;
+  const bool unprotected = rex::memory::Protect(host, 4, rex::memory::PageAccess::kReadWrite, &old_access);
+#endif
+  Store(host, bits);
+  if (unprotected) {
+#if defined(_WIN32)
+    VirtualProtect(host, 4, old_protect, &old_protect);
+#else
+    rex::memory::Protect(host, 4, old_access);
+#endif
+  }
+}
+
+uint32_t AspectBits() {
+  const float aspect = AspectRatio();
+  uint32_t bits;
+  std::memcpy(&bits, &aspect, 4);
+  return std::fabs(aspect - 16.0f / 9.0f) < 1e-4f ? kAspect16x9Bits : bits;
+}
 
 bool Parse(const std::string& text, uint32_t& x, uint32_t& y) {
   const size_t colon = text.find(':');
@@ -77,38 +121,37 @@ void PatchGame(uint8_t* virtual_membase) {
                 REXCVAR_GET(tenchuz_aspect_ratio));
     return;
   }
-  const float aspect = AspectRatio();
-  if (std::fabs(aspect - 16.0f / 9.0f) < 1e-4f) {
+  const uint32_t bits = AspectBits();
+  if (bits == kAspect16x9Bits) {
     return;
   }
   uint8_t* host = virtual_membase + kAspectConstant;
-  const uint32_t current = (uint32_t(host[0]) << 24) | (uint32_t(host[1]) << 16) | (uint32_t(host[2]) << 8) | host[3];
+  const uint32_t current = Load(host);
   if (current != kAspect16x9Bits) {
     REXLOG_WARN("tenchuz: aspect ratio not patched: {:08X} holds {:08X}, not 16/9", kAspectConstant, current);
     return;
   }
-  uint32_t bits;
-  std::memcpy(&bits, &aspect, 4);
-#if defined(_WIN32)
-  DWORD old_protect = 0;
-  const bool unprotected = VirtualProtect(host, 4, PAGE_READWRITE, &old_protect);
-#else
-  rex::memory::PageAccess old_access = rex::memory::PageAccess::kReadOnly;
-  const bool unprotected = rex::memory::Protect(host, 4, rex::memory::PageAccess::kReadWrite, &old_access);
-#endif
-  host[0] = uint8_t(bits >> 24);
-  host[1] = uint8_t(bits >> 16);
-  host[2] = uint8_t(bits >> 8);
-  host[3] = uint8_t(bits);
-  if (unprotected) {
-#if defined(_WIN32)
-    VirtualProtect(host, 4, old_protect, &old_protect);
-#else
-    rex::memory::Protect(host, 4, old_access);
-#endif
+  StoreConstant(host, bits);
+  g_applied_bits = bits;
+  REXLOG_INFO("tenchuz: aspect ratio {:.4f} ({}), patched at {:08X}", AspectRatio(),
+              REXCVAR_GET(tenchuz_aspect_ratio), kAspectConstant);
+}
+
+void Update(uint8_t* virtual_membase) {
+  const uint32_t bits = AspectBits();
+  if (bits == g_applied_bits) {
+    return;
   }
-  REXLOG_INFO("tenchuz: aspect ratio {:.4f} ({}), patched at {:08X}", aspect, REXCVAR_GET(tenchuz_aspect_ratio),
-              kAspectConstant);
+  StoreConstant(virtual_membase + kAspectConstant, bits);
+  // The copies, where they still hold the old aspect.
+  for (uint32_t address : {kDisplayAspect, kCameraAspect}) {
+    uint8_t* host = virtual_membase + address;
+    if (Load(host) == g_applied_bits) {
+      Store(host, bits);
+    }
+  }
+  g_applied_bits = bits;
+  REXLOG_INFO("tenchuz: aspect ratio {:.4f} ({})", AspectRatio(), REXCVAR_GET(tenchuz_aspect_ratio));
 }
 
 }  // namespace tenchuz::widescreen

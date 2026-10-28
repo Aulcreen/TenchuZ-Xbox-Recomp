@@ -377,7 +377,7 @@ with a few fixed-step candidates to test at 60 fps.
 - **N6 PC rendering features.** Internal resolution scaling, MSAA/SMAA, widescreen/ultrawide FOV,
   and HUD scaling.
   - **N6.1 Internal resolution scaling.** ✅ *Done (2026-10-20)*.
-    `--tenchuz_native_resolution_scale=N` (1-4, read at startup) renders natively at N times the
+    `--tenchuz_native_resolution_scale=N` (1-4, changeable while playing) renders natively at N times the
     game's resolution on each axis, like the SDK's draw resolution scale:
     - Render targets, depth buffers and resolve destinations are N times larger. They keep their
       guest size for lookups, so texture fetches still find resolves by address and size.
@@ -456,6 +456,24 @@ with a few fixed-step candidates to test at 60 fps.
         target without depth would be.
       - The ultrawide image is anamorphic. Rendering targets wider than the game's 1280 needs
         the game's 2D and post passes to cope, and is not done.
+
+- **GPU cost and tiled passes (2026-10-28).** A one-frame GPU profile (`gpuprofile` script step,
+  `DrawPath::RequestProfile`: a timestamp after every draw and operation, logged per render target
+  and operation) showed a third of the GPU time at 2x / 4x MSAA in our resolves. The game draws
+  1280x720 and its shadow map in 2 tiles and resolves each tile's half (a source rectangle and
+  destination point, which we ignored) with a clear between tiles. We render untiled, so every
+  resolve copied the whole target, and the clear between the shadow map's halves wiped it before
+  the second copy: characters' own shadows were missing. Now:
+  - resolves copy the rectangle to the destination point; in a tiled pass a tile's part at its own
+    place is the whole target, copied once, and repeats from an unchanged source are skipped
+    (`AlreadyResolved`, per-surface write counts);
+  - the game's clears between BeginTiling and EndTiling wait for the next draw;
+  - depth buffers are D32_FLOAT (the game's depth is 24-bit float) until a draw asks for stencil,
+    then D32_FLOAT_S8X24 for the session (`--tenchuz_native_depth32`);
+  - MSAA colour resolves that average every sample use `ResolveSubresource`
+    (`--tenchuz_native_hardware_resolve`; `ResolveSubresourceRegion` removed the device here).
+  - Mission 1 at 2x, 4x MSAA: 10.5-11.7 ms of GPU time a frame before, 8.6-9.5 after, with the
+    same image (mean difference 0.44 of 255, run-to-run noise 0.36-0.42) plus the shadows.
 
 - **Fixed (2026-10-21), from the first player reports:**
   - **Bloodied characters rendered black.** Each fighting character's blood map is a 256×256

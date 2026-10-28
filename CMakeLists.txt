@@ -87,15 +87,18 @@ endif()
 rexglue_setup_target(tenchuz GPU_PLUGINS xenos)
 if(WIN32)
     target_link_libraries(tenchuz PRIVATE ws2_32 dbghelp winmm synchronization windowscodecs ole32)
+    target_sources(tenchuz PRIVATE src/tenchuz.rc)  # "Tenchu Z" in Task Manager and Explorer
 endif()
 
 # Setup.exe: the installer stub. tools/package_release.ps1 appends the game
 # files to it (TenchuZ-Setup-<version>.exe), which installs them and copies the
 # player's own disc image into game\ (src/setup/setup_main.cpp).
 if(WIN32)
-    add_executable(tenchuz_setup src/setup/setup_main.cpp)
-    set_target_properties(tenchuz_setup PROPERTIES OUTPUT_NAME "Setup")
-    target_link_libraries(tenchuz_setup PRIVATE bcrypt cabinet ole32 shell32 uuid)
+    add_executable(tenchuz_setup WIN32 src/setup/setup_main.cpp)
+    # The C runtime linked in: the uninstaller runs from a copy in %TEMP%, away
+    # from the app-local VC++ DLLs, on PCs that may not have them installed.
+    set_target_properties(tenchuz_setup PROPERTIES OUTPUT_NAME "Setup" MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    target_link_libraries(tenchuz_setup PRIVATE bcrypt cabinet ole32 shell32 uuid gdiplus advapi32)
 endif()
 
 # System Link over Steam, when the Steamworks SDK (the zip's sdk folder) is in

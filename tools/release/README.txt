@@ -21,8 +21,10 @@ Install
 3. Start Tenchu Z from the Start menu or the desktop shortcut.
 
 Once installed, the disc image isn't needed: you can move or delete it.
-Saves go to the "user" folder in the install folder. To uninstall, delete the
-install folder (back up "user" first to keep your saves) and the shortcuts.
+Saves go to the "user" folder in the install folder.
+
+Uninstall from Windows Settings > Apps > Installed apps ("Tenchu Z (PC
+recompilation)"). It asks whether to keep your saves and settings.
 Setup.exe in the install folder re-copies the game data from a disc image if
 the "game" folder is damaged.
 

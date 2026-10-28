@@ -442,6 +442,8 @@ void Enter(uint32_t function, uint8_t* base) {
   }
 }
 
+uint32_t TopFunction() { return g_depth > 0 ? g_top_function : 0; }
+
 void Exit(uint32_t function, uint8_t* base) {
   if (!OnRenderThread()) {
     return;

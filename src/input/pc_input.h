@@ -54,6 +54,15 @@ std::string Binding(const char* id);
 void SetBinding(const char* id, const std::string& keys);
 std::string DefaultBinding(const char* id);
 
+// Controller remapping: the physical button (A, B, X, Y, LB, RB, LT, RT, LS,
+// RS, Back, Start, Up, Down, Left, Right) each of the game's button actions
+// comes from (cvar tenchuz_pad_<id>, the ids of the button controls above).
+const std::vector<Control>& PadActions();
+const std::vector<const char*>& PadButtons();
+std::string PadBinding(const char* id);
+void SetPadBinding(const char* id, const std::string& button);
+std::string DefaultPadBinding(const char* id);
+
 // The menu's key capture: the next key or mouse button pressed, as a name, or
 // empty while none has been.
 void BeginCapture();

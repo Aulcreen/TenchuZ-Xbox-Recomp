@@ -57,8 +57,10 @@ constexpr const char* kSavedSettings[] = {
     "tenchuz_frame_rate",    "fullscreen",           "tenchuz_aspect_ratio",      "tenchuz_widescreen_hud",
     "tenchuz_input_device",  "tenchuz_mouse_camera", "tenchuz_mouse_sensitivity", "tenchuz_mouse_invert_y",
     "tenchuz_walk_speed",    "tenchuz_volume",       "audio_mute",                "tenchuz_netplay",
+    "tenchuz_steam_public",
 #if defined(_WIN32)
     "tenchuz_native_resolution_scale", "tenchuz_native_post_effect", "tenchuz_native_msaa_samples",
+    "tenchuz_native_anisotropy",       "tenchuz_native_sharpening",
 #endif
 };
 
@@ -77,7 +79,7 @@ void Save(const std::filesystem::path& path) {
       const size_t eq = line.find('=');
       std::string key = line.substr(0, eq);
       key.erase(key.find_last_not_of(" \t") + 1);
-      bool ours = key.starts_with("tenchuz_key_");
+      bool ours = key.starts_with("tenchuz_key_") || key.starts_with("tenchuz_pad_");
       for (const char* name : kSavedSettings) ours = ours || key == name;
       for (const char* name : kRetiredSettings) ours = ours || key == name;
       if (!ours) lines.push_back(line);
@@ -93,6 +95,9 @@ void Save(const std::filesystem::path& path) {
   }
   for (const input::Control& c : input::Controls()) {
     lines.push_back("tenchuz_key_" + std::string(c.id) + " = \"" + input::Binding(c.id) + "\"");
+  }
+  for (const input::Control& c : input::PadActions()) {
+    lines.push_back("tenchuz_pad_" + std::string(c.id) + " = \"" + input::PadBinding(c.id) + "\"");
   }
   std::ofstream out(path, std::ios::trunc);
   for (const std::string& line : lines) out << line << "\n";
@@ -282,20 +287,20 @@ class GameMenu final : public rex::ui::ImGuiDialog {
   }
 
   void DrawDisplay() {
-    Choice("Frame rate", "tenchuz_frame_rate",
-           {{"30", "30"}, {"60", "60"}, {"120", "120"}, {"144", "144"}, {"165", "165"}, {"180", "180"},
-            {"240", "240"}});
+    Choice("Frame rate", "tenchuz_frame_rate", {{"30", "30"}, {"60", "60"}});
     Check("Fullscreen", "fullscreen");
     Choice("Aspect ratio", "tenchuz_aspect_ratio",
-           {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}, {"32:9", "32:9"}}, "(restart)");
+           {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}, {"32:9", "32:9"}});
     Check("HUD at 16:9", "tenchuz_widescreen_hud");
     if (!kWindows) return;
     Choice("Resolution", "tenchuz_native_resolution_scale",
-           {{"1", "720p (original)"}, {"2", "1440p (2x)"}, {"3", "2160p (3x)"}, {"4", "2880p (4x)"}},
-           "(restart)");
+           {{"1", "720p (original)"}, {"2", "1440p (2x)"}, {"3", "2160p (3x)"}, {"4", "2880p (4x)"}});
     Choice("Anti-aliasing", "tenchuz_native_post_effect",
            {{"none", "Off"}, {"fxaa", "FXAA"}, {"fxaa_extreme", "FXAA (strong)"}});
-    Choice("MSAA", "tenchuz_native_msaa_samples", {{"0", "2x (original)"}, {"4", "4x"}}, "(restart)");
+    Choice("MSAA", "tenchuz_native_msaa_samples", {{"0", "2x (original)"}, {"4", "4x"}});
+    Choice("Texture filtering", "tenchuz_native_anisotropy",
+           {{"0", "Original"}, {"2", "2x"}, {"4", "4x"}, {"8", "8x"}, {"16", "16x"}});
+    SliderFloat("Sharpening", "tenchuz_native_sharpening", 0.0f, 1.0f, "%.2f");
   }
 
   void DrawControls() {
@@ -304,8 +309,10 @@ class GameMenu final : public rex::ui::ImGuiDialog {
            {{"auto", controller ? "Auto (controller)" : "Auto (keyboard and mouse)"},
             {"keyboard", "Keyboard and mouse"},
             {"controller", "Controller"}});
-    // Keyboard and mouse settings, greyed out while the controller is in use.
-    ImGui::BeginDisabled(controller);
+    if (controller) {
+      DrawPadBindings();
+      return;
+    }
     Check("Mouse camera", "tenchuz_mouse_camera");
     SliderFloat("Mouse sensitivity", "tenchuz_mouse_sensitivity", 0.1f, 5.0f, "%.2f");
     Check("Invert mouse Y", "tenchuz_mouse_invert_y");
@@ -370,7 +377,43 @@ class GameMenu final : public rex::ui::ImGuiDialog {
       Set("tenchuz_mouse_invert_y", "false");
       changed_ = true;
     }
-    ImGui::EndDisabled();
+  }
+
+  // The controller: which button does each of the game's actions.
+  void DrawPadBindings() {
+    ImGui::Separator();
+    const float row_h = ImGui::GetFrameHeightWithSpacing();
+    ImGui::BeginChild("pad", ImVec2(0, ImGui::GetContentRegionAvail().y - row_h * 2.2f), false);
+    ImGui::SetWindowFontScale(scale_);
+    if (ImGui::BeginTable("pad", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+      ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+      ImGui::TableSetupColumn("Button", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+      ImGui::TableHeadersRow();
+      for (const input::Control& c : input::PadActions()) {
+        const std::string current = input::PadBinding(c.id);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(c.label);
+        ImGui::TableSetColumnIndex(1);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo((std::string("##pad_") + c.id).c_str(), current.c_str())) {
+          for (const char* button : input::PadButtons()) {
+            if (ImGui::Selectable(button, current == button)) {
+              input::SetPadBinding(c.id, button);
+              changed_ = true;
+            }
+          }
+          ImGui::EndCombo();
+        }
+      }
+      ImGui::EndTable();
+    }
+    ImGui::EndChild();
+    if (ImGui::Button("Reset controls")) {
+      for (const input::Control& c : input::PadActions()) input::SetPadBinding(c.id, input::DefaultPadBinding(c.id));
+      changed_ = true;
+    }
   }
 
   void DrawAudio() {
@@ -398,6 +441,31 @@ class GameMenu final : public rex::ui::ImGuiDialog {
     if (!status.steam) return;
     Row("Lobby", nullptr);
     ImGui::Text("%d %s", status.lobby_players, status.lobby_players == 1 ? "player" : "players");
+    Check("Public lobby", "tenchuz_steam_public");
+    if (GetBool("tenchuz_steam_public")) {
+      ImGui::Separator();
+      if (status.lobbies.empty()) {
+        ImGui::TextDisabled("No public games");
+      } else if (ImGui::BeginTable("public", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Public game", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        ImGui::TableSetupColumn("Players", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+        ImGui::TableHeadersRow();
+        for (const net::PublicLobby& lobby : status.lobbies) {
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(0);
+          ImGui::AlignTextToFramePadding();
+          ImGui::TextUnformatted(lobby.host.c_str());
+          ImGui::TableSetColumnIndex(1);
+          ImGui::Text("%d / %d", lobby.players, lobby.max_players);
+          ImGui::TableSetColumnIndex(2);
+          ImGui::PushID(("lobby" + std::to_string(lobby.id)).c_str());
+          if (ImGui::Button("Join", ImVec2(-1, 0))) net::JoinLobby(lobby.id);
+          ImGui::PopID();
+        }
+        ImGui::EndTable();
+      }
+    }
     ImGui::Separator();
     ImGui::BeginChild("friends", ImVec2(0, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 1.2f),
                       false);

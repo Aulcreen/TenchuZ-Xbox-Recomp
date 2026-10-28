@@ -32,6 +32,12 @@ void TogglePresentNative();
 // Writes the resolved images of the next native frame to logs/frame_dumps.
 void RequestFrameDump();
 
+// Where the native renderer keeps its compiled pipelines between runs (before Initialize).
+void SetCacheDir(const std::filesystem::path& dir);
+
+// Logs where the GPU time of the next presented frame goes (draw_path.h).
+void RequestGpuProfile();
+
 // Saves the next presented frame (display gamma applied) as a PNG.
 void RequestScreenshot(const std::filesystem::path& path);
 

@@ -27,6 +27,9 @@ bool Active();
 void Enter(uint32_t function, uint8_t* base);
 void Exit(uint32_t function, uint8_t* base);
 
+// The outermost hooked D3D function the render thread is in (0 when none).
+uint32_t TopFunction();
+
 // Frame boundary from the Swap hook; r3 is the D3D device.
 void OnSwap(uint32_t device, uint8_t* base);
 

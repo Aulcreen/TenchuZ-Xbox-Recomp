@@ -20,7 +20,10 @@
 // Join Game in Steam) moves you to a friend's, and with
 // --tenchuz_steam_autojoin a player alone in their lobby joins a friend's
 // Tenchu Z lobby by itself (the lower SteamID hosts, so two players starting
-// together meet in one lobby).
+// together meet in one lobby). With --tenchuz_steam_public the lobby is
+// public, and every few seconds a search lists other players' public Tenchu Z
+// lobbies (the "tenchuz" lobby key tells them from other App ID 480 games)
+// for the Online tab's Join.
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -55,6 +58,8 @@
 
 REXCVAR_DEFINE_BOOL(tenchuz_steam_autojoin, true, "tenchuz",
                     "Steam System Link: when alone in your lobby, join a friend's Tenchu Z lobby");
+REXCVAR_DEFINE_BOOL(tenchuz_steam_public, false, "tenchuz",
+                    "Steam System Link: your lobby is public, listed for every Tenchu Z player (else friends only)");
 
 namespace tenchuz::net {
 namespace {
@@ -208,6 +213,13 @@ class SteamSession {
     }
   }
 
+  void JoinPublicLobby(uint64_t id) {
+    const CSteamID lobby{uint64(id)};
+    if (!lobby.IsValid() || lobby == lobby_) return;
+    REXLOG_INFO("tenchuz: netplay steam: joining public lobby {}", id);
+    SteamMatchmaking()->JoinLobby(lobby);
+  }
+
   void InviteFriend(uint64_t id) {
     if (!lobby_.IsValid()) return;
     const bool sent = SteamMatchmaking()->InviteUserToLobby(lobby_, CSteamID(id));
@@ -223,6 +235,8 @@ class SteamSession {
     }
     const CSteamID lobby(result->m_ulSteamIDLobby);
     SteamMatchmaking()->SetLobbyData(lobby, kLobbyKey, "1");
+    SteamMatchmaking()->SetLobbyData(lobby, "host", SteamFriends()->GetPersonaName());
+    public_ = false;  // made friends-only; ApplyVisibility sets the wanted type
     REXLOG_INFO("tenchuz: netplay steam: opened lobby {}; friends can join from Steam or the game menu",
                 lobby.ConvertToUint64());
   }
@@ -320,8 +334,63 @@ class SteamSession {
   // of friends running App ID 480 (their data says whether it's Tenchu Z).
   // While alone, a friend's Tenchu Z lobby with a lower SteamID gets joined
   // (OnLobbyDataUpdate).
+  // The lobby's type follows --tenchuz_steam_public (the Online tab's switch).
+  // Only the lobby's owner can change it; in someone else's lobby theirs holds.
+  void ApplyVisibility() {
+    const bool want = REXCVAR_GET(tenchuz_steam_public);
+    if (!lobby_.IsValid() || want == public_ || SteamMatchmaking()->GetLobbyOwner(lobby_) != self_) return;
+    if (SteamMatchmaking()->SetLobbyType(lobby_, want ? k_ELobbyTypePublic : k_ELobbyTypeFriendsOnly)) {
+      public_ = want;
+      REXLOG_INFO("tenchuz: netplay steam: lobby {} is now {}", lobby_.ConvertToUint64(),
+                  want ? "public" : "friends only");
+    }
+  }
+
+  // Other players' public Tenchu Z lobbies, every 10 s while ours is public.
+  void MaybeSearch(std::chrono::steady_clock::time_point now) {
+    if (!REXCVAR_GET(tenchuz_steam_public)) {
+      std::lock_guard lock(status_mutex_);
+      public_lobbies_.clear();
+      return;
+    }
+    if (now < next_search_ || lobby_list_.IsActive()) return;
+    next_search_ = now + std::chrono::seconds(10);
+    SteamMatchmaking()->AddRequestLobbyListStringFilter(kLobbyKey, "1", k_ELobbyComparisonEqual);
+    SteamMatchmaking()->AddRequestLobbyListDistanceFilter(k_ELobbyDistanceFilterWorldwide);
+    SteamMatchmaking()->AddRequestLobbyListResultCountFilter(50);
+    lobby_list_.Set(SteamMatchmaking()->RequestLobbyList(), this, &SteamSession::OnLobbyList);
+  }
+
+  void OnLobbyList(LobbyMatchList_t* result, bool io_failure) {
+    std::vector<PublicLobby> lobbies;
+    if (!io_failure) {
+      for (uint32 i = 0; i < result->m_nLobbiesMatching; ++i) {
+        const CSteamID lobby = SteamMatchmaking()->GetLobbyByIndex(int(i));
+        if (lobby == lobby_) continue;
+        PublicLobby entry;
+        entry.id = lobby.ConvertToUint64();
+        entry.host = SteamMatchmaking()->GetLobbyData(lobby, "host");
+        if (entry.host.empty()) entry.host = "Player";
+        entry.players = SteamMatchmaking()->GetNumLobbyMembers(lobby);
+        entry.max_players = SteamMatchmaking()->GetLobbyMemberLimit(lobby);
+        if (entry.max_players > 0 && entry.players >= entry.max_players) continue;  // full
+        lobbies.push_back(std::move(entry));
+      }
+    }
+    std::stable_sort(lobbies.begin(), lobbies.end(),
+                     [](const PublicLobby& a, const PublicLobby& b) { return a.players > b.players; });
+    if (lobbies.size() != logged_public_count_) {
+      logged_public_count_ = lobbies.size();
+      REXLOG_INFO("tenchuz: netplay steam: {} public Tenchu Z lobbies", lobbies.size());
+    }
+    std::lock_guard lock(status_mutex_);
+    public_lobbies_ = std::move(lobbies);
+  }
+
   void MaybeScan() {
     const auto now = std::chrono::steady_clock::now();
+    ApplyVisibility();
+    MaybeSearch(now);
     if (now < next_scan_) return;
     next_scan_ = now + std::chrono::seconds(3);
     OnlineStatus status;
@@ -365,6 +434,7 @@ class SteamSession {
       return (a.with_you || a.in_game) > (b.with_you || b.in_game);
     });
     std::lock_guard lock(status_mutex_);
+    status.lobbies = public_lobbies_;
     status_ = std::move(status);
   }
 
@@ -453,6 +523,11 @@ class SteamSession {
   uint32_t local_ip_ = 0;
   CSteamID lobby_;
   CCallResult<SteamSession, LobbyCreated_t> lobby_created_;
+  CCallResult<SteamSession, LobbyMatchList_t> lobby_list_;
+  bool public_ = false;  // the lobby's type as last set
+  std::chrono::steady_clock::time_point next_search_{};
+  std::vector<PublicLobby> public_lobbies_;  // OnLobbyList (status_mutex_)
+  size_t logged_public_count_ = SIZE_MAX;
   struct LobbyInfo {
     bool tenchu = false;
     std::chrono::steady_clock::time_point next_request{};
@@ -533,6 +608,10 @@ void JoinFriend(uint64_t id) {
 
 void InviteFriend(uint64_t id) {
   if (SteamSession* session = g_session) session->Post([session, id] { session->InviteFriend(id); });
+}
+
+void JoinLobby(uint64_t lobby) {
+  if (SteamSession* session = g_session) session->Post([session, lobby] { session->JoinPublicLobby(lobby); });
 }
 
 }  // namespace tenchuz::net

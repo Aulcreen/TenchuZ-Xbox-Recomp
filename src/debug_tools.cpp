@@ -9,6 +9,7 @@
 //
 // --tenchuz_watch_write=0xADDR: a hardware write watchpoint (4 bytes) on that
 // guest address in the main thread; each new writer is logged by name.
+// --tenchuz_watch_reads=true makes it watch reads too.
 
 #include "debug_tools.h"
 
@@ -33,6 +34,7 @@ REXCVAR_DEFINE_INT32(tenchuz_dump_memory_at_frame, 0, "tenchuz", "Dump guest mem
 REXCVAR_DEFINE_INT32(tenchuz_dump_memory_frames, 3, "tenchuz", "Consecutive frames to dump");
 REXCVAR_DEFINE_STRING(tenchuz_watch_write, "", "tenchuz",
                       "Guest address (hex) whose writes from the main thread are logged by function");
+REXCVAR_DEFINE_BOOL(tenchuz_watch_reads, false, "tenchuz", "tenchuz_watch_write logs reads too");
 
 namespace tenchuz::debug_tools {
 namespace {
@@ -50,6 +52,9 @@ std::atomic<uint64_t> g_watch_hits{0};
 int g_logged_writers = 0;
 
 std::atomic<bool> g_image_dump_requested{false};
+std::atomic<uint32_t> g_watch_requested{0};
+std::atomic<int> g_frame_dumps_requested{0};
+int g_frame_dumps_left = 0;
 
 void Dump(uint8_t* base, uint64_t frame, bool image_only = false) {
   std::filesystem::path path;
@@ -133,12 +138,19 @@ std::string Symbol(uint64_t pc) {
   if (initialized && SymFromAddr(GetCurrentProcess(), pc, &displacement, info)) {
     return fmt::format("{}+0x{:X}", info->Name, displacement);
   }
+  HMODULE module = nullptr;  // without symbols: module+offset, for an offline lookup
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCWSTR>(pc), &module)) {
+    char name[MAX_PATH] = {};
+    GetModuleFileNameA(module, name, MAX_PATH);
+    return fmt::format("{}+0x{:X}", std::filesystem::path(name).filename().string(), pc - uint64_t(module));
+  }
   return fmt::format("{:X}", pc);
 }
 
 // Sets DR0 on the calling (main) thread from a helper thread.
 void ArmWatch(uint8_t* base, uint32_t guest) {
-  AddVectoredExceptionHandler(1, OnException);
+  static bool handler = (AddVectoredExceptionHandler(1, OnException), true);
   const DWORD main = GetCurrentThreadId();
   const uint64_t host = uint64_t(base + guest);
   std::thread([main, host] {
@@ -149,8 +161,9 @@ void ArmWatch(uint8_t* base, uint32_t guest) {
     context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     GetThreadContext(thread, &context);
     context.Dr0 = host;
-    // L0 enable, R/W0 = 01 (writes), LEN0 = 11 (4 bytes).
-    context.Dr7 = (context.Dr7 & ~0xF0003ull) | 0x1ull | (0x1ull << 16) | (0x3ull << 18);
+    // L0 enable, R/W0 = 01 (writes) or 11 (reads and writes), LEN0 = 11 (4 bytes).
+    const uint64_t access = REXCVAR_GET(tenchuz_watch_reads) ? 0x3ull : 0x1ull;
+    context.Dr7 = (context.Dr7 & ~0xF0003ull) | 0x1ull | (access << 16) | (0x3ull << 18);
     SetThreadContext(thread, &context);
     ResumeThread(thread);
     CloseHandle(thread);
@@ -169,28 +182,45 @@ void OnMainLoopFrame(uint8_t* base) {
   if (g_image_dump_requested.exchange(false)) {
     Dump(base, frame, true);
   }
+  if (const int n = g_frame_dumps_requested.exchange(0)) {
+    g_frame_dumps_left = n;
+  }
+  if (g_frame_dumps_left > 0) {
+    --g_frame_dumps_left;
+    Dump(base, frame);
+  }
+  static uint32_t watching = 0;
+  if (const uint32_t guest = g_watch_requested.exchange(0)) {
+    watching = guest;
+    ArmWatch(base, guest);
+  }
   const std::string& watch = REXCVAR_GET(tenchuz_watch_write);
-  if (!watch.empty()) {
-    static bool armed = false;
-    if (!armed) {
-      armed = true;
-      ArmWatch(base, uint32_t(std::stoul(watch, nullptr, 16)));
+  if (!watching && !watch.empty()) {
+    watching = uint32_t(std::stoul(watch, nullptr, 16));
+    ArmWatch(base, watching);
+  }
+  if (!watching) return;
+  const int count = std::min(g_writer_count.load(), kMaxWriters);
+  for (; g_logged_writers < count; ++g_logged_writers) {
+    const uint64_t pc = g_writers[g_logged_writers].load();
+    if (!pc) break;  // not published yet
+    std::string stack;
+    for (int d = 1; d < kStackDepth && g_writer_stacks[g_logged_writers][d]; ++d) {
+      const std::string name = Symbol(g_writer_stacks[g_logged_writers][d]);
+      if (name.find("sub_") == std::string::npos && name.find("xstart") == std::string::npos &&
+          name.find("tenchuz.exe+") == std::string::npos)
+        continue;
+      stack += " < " + name;
     }
-    const int count = std::min(g_writer_count.load(), kMaxWriters);
-    for (; g_logged_writers < count; ++g_logged_writers) {
-      const uint64_t pc = g_writers[g_logged_writers].load();
-      if (!pc) break;  // not published yet
-      std::string stack;
-      for (int d = 1; d < kStackDepth && g_writer_stacks[g_logged_writers][d]; ++d) {
-        const std::string name = Symbol(g_writer_stacks[g_logged_writers][d]);
-        if (name.find("sub_") == std::string::npos && name.find("xstart") == std::string::npos) continue;
-        stack += " < " + name;
-      }
-      REXLOG_INFO("tenchuz: write to {} from {} (frame {}, {} writes so far){}", watch, Symbol(pc), frame,
-                  g_watch_hits.load(), stack);
-    }
+    REXLOG_INFO("tenchuz: {} {:08X} from {} (frame {}, {} hits so far){}",
+                REXCVAR_GET(tenchuz_watch_reads) ? "access to" : "write to", watching, Symbol(pc), frame,
+                g_watch_hits.load(), stack);
   }
 }
+
+void RequestWatch(uint32_t guest) { g_watch_requested = guest; }
+
+void RequestFrameDumps(int frames) { g_frame_dumps_requested = frames; }
 
 void RequestImageDump() { g_image_dump_requested = true; }
 

@@ -58,15 +58,23 @@ struct OnlineFriend {
   bool in_game = false;   // in a Tenchu Z lobby: Join
   bool with_you = false;  // in your lobby
 };
+// A public Tenchu Z lobby anyone can join (--tenchuz_steam_public).
+struct PublicLobby {
+  uint64_t id = 0;
+  std::string host;
+  int players = 0, max_players = 0;
+};
 struct OnlineStatus {
   bool steam = false;           // in a Steam lobby
   bool steam_starting = false;  // attached, System Link not on Steam yet
   std::string name;
   int lobby_players = 0;
   std::vector<OnlineFriend> friends;  // online, Tenchu Z players first
+  std::vector<PublicLobby> lobbies;   // other players' public lobbies, fullest first
 };
 OnlineStatus GetOnlineStatus();
 void JoinFriend(uint64_t id);
+void JoinLobby(uint64_t lobby);
 void InviteFriend(uint64_t id);
 
 }  // namespace tenchuz::net

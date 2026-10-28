@@ -64,7 +64,7 @@ REXCVAR_DEFINE_DOUBLE(tenchuz_walk_speed, 0.4, "tenchuz/Controls",
     .range(0.1, 1.0);
 REXCVAR_DEFINE_STRING(tenchuz_input_script, "", "tenchuz",
                       "Test input: comma-separated <seconds>:<control>[+<control>...][/<hold ms>] (controls as "
-                      "in tenchuz_key_*), or <seconds>:shot:<name>, :dump (renderer), :memdump (game globals), :profile, :menu:<seconds open>, :skip2d (wait out loading "
+                      "in tenchuz_key_*), or <seconds>:shot:<name>, :dump (renderer), :memdump (game globals), :profile, :menu:<seconds open>, :set:<setting>=<value>, :gpuprofile, :skip2d (wait out loading "
                       "screens, pressing Start), :quit. "
                       "Works without focus");
 REXCVAR_DEFINE_BOOL(tenchuz_input_log, false, "tenchuz", "Log the merged pad state when it changes");
@@ -76,6 +76,16 @@ REXCVAR_DEFINE_BOOL(tenchuz_input_log, false, "tenchuz", "Log the merged pad sta
 #define TENCHUZ_DEFINE_KEY_CVAR(id, label, keys) \
   REXCVAR_DEFINE_STRING(tenchuz_key_##id, keys, "tenchuz/Controls", label);
 TENCHUZ_CONTROLS(TENCHUZ_DEFINE_KEY_CVAR)
+
+// Controller remapping: the game's button actions (the button controls above)
+// and the physical button each comes from, by default its own.
+#define TENCHUZ_PAD_ACTIONS(X)                                                                                   \
+  X(a, "A") X(b, "B") X(x, "X") X(y, "Y") X(lb, "LB") X(rb, "RB") X(lt, "LT") X(rt, "RT") X(ls, "LS") X(rs, "RS") \
+  X(back, "Back") X(start, "Start") X(dpad_up, "Up") X(dpad_down, "Down") X(dpad_left, "Left")               \
+  X(dpad_right, "Right")
+#define TENCHUZ_DEFINE_PAD_CVAR(id, button) \
+  REXCVAR_DEFINE_STRING(tenchuz_pad_##id, button, "tenchuz/Controls", "Controller button for this action");
+TENCHUZ_PAD_ACTIONS(TENCHUZ_DEFINE_PAD_CVAR)
 
 namespace tenchuz::input {
 namespace {
@@ -280,11 +290,20 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
 
   // Merges keyboard, mouse and script input into the state the game read
   // (`result`: 0 if a controller is connected). Returns the new result.
+  // The camera stick from the mouse (and camera keys) as the game's stick
+  // values, which may pass 1, when the last poll of pad 0 used it.
+  bool MouseLook(float& x, float& y) const {
+    x = look_x_;
+    y = look_y_;
+    return look_active_;
+  }
+
   uint32_t Poll(uint8_t* base, uint32_t user, uint32_t state, uint32_t result) {
     if (user != 0 || !state) {
       if (menu_open_ && result == 0) Clear(base, state);
       return result;
     }
+    look_active_ = false;
     using Clock = std::chrono::steady_clock;
     const auto now = Clock::now();
     const double dt = std::clamp(std::chrono::duration<double>(now - last_poll_).count(), 1.0 / 240.0, 1.0 / 15.0);
@@ -313,6 +332,7 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
     if (!keyboard) {
       if (result == 0) pad = Read(base, state);
       if (steam_controller) Merge(pad, steam_pad);
+      pad = Remap(pad);
     }
     if (!controller_input_seen_ && (pad.buttons || pad.lt || pad.rt)) {
       controller_input_seen_ = true;
@@ -371,18 +391,29 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
     }
     if ((mouse && mouse_captured_) || script_look) {
       // Counts per second to deflection: full deflection at 2500 counts/s
-      // at sensitivity 1, past the game's dead zone.
+      // at sensitivity 1, past the game's dead zone. The stick stops there,
+      // which caps the camera at a controller's top speed, so the game's own
+      // stick values get the deflection unclamped too (the sub_8228C7D8 hook),
+      // and the camera skips its stick ramp (SkipCameraRamp): at sensitivity
+      // 1 that turns it about 0.0008 radians per count.
       const double sens = REXCVAR_GET(tenchuz_mouse_sensitivity);
       const double dead = REXCVAR_GET(tenchuz_mouse_deadzone);
       const double invert = REXCVAR_GET(tenchuz_mouse_invert_y) ? -1.0 : 1.0;
-      auto axis = [&](double counts, double& smoothed) {
+      auto axis = [&](double counts, double& smoothed, float& look) {
         smoothed = 0.5 * smoothed + 0.5 * (counts / dt);  // two polls of smoothing
-        const double v = std::clamp(smoothed * sens / 2500.0, -1.0, 1.0);
+        const double unclamped = smoothed * sens / 2500.0;
+        look = float(std::clamp(unclamped, -double(kMaxLook), double(kMaxLook)));
+        const double v = std::clamp(unclamped, -1.0, 1.0);
         if (std::abs(v) < 1e-3) return 0;
         return int32_t(std::copysign(dead + (1.0 - dead) * std::abs(v), v) * kFull);
       };
-      rx += axis(mouse_x, smooth_x_);
-      ry += axis(-mouse_y * invert, smooth_y_);
+      float look_x = 0, look_y = 0;
+      const int32_t keys_x = rx, keys_y = ry;
+      rx += axis(mouse_x, smooth_x_, look_x);
+      ry += axis(-mouse_y * invert, smooth_y_, look_y);
+      look_x_ = std::clamp(float(keys_x) / kFull + look_x, -kMaxLook, kMaxLook);
+      look_y_ = std::clamp(float(keys_y) / kFull + look_y, -kMaxLook, kMaxLook);
+      look_active_ = true;
     } else {
       smooth_x_ = smooth_y_ = 0;
     }
@@ -451,6 +482,54 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
   }
 
   void Clear(uint8_t* base, uint32_t state) const { Write(base, state, Pad{}); }
+
+  // The game's buttons from the physical ones (tenchuz_pad_<id>). A trigger
+  // action keeps a trigger's analog value; a button bound to a trigger
+  // presses past XInput's trigger threshold.
+  static Pad Remap(const Pad& in) {
+    struct Binding {
+      uint32_t control;
+      const char* cvar;
+    };
+    static const Binding kBindings[] = {
+#define TENCHUZ_PAD_BINDING(id, button) {k_##id, "tenchuz_pad_" #id},
+        TENCHUZ_PAD_ACTIONS(TENCHUZ_PAD_BINDING)
+#undef TENCHUZ_PAD_BINDING
+    };
+    constexpr uint8_t kTriggerThreshold = 30;
+    Pad out = in;
+    out.buttons = 0;
+    out.lt = out.rt = 0;
+    for (const Binding& b : kBindings) {
+      const uint32_t from = PhysicalControl(rex::cvar::GetFlagByName(b.cvar), b.control);
+      uint8_t value;  // 0-255
+      if (from == k_lt || from == k_rt) {
+        value = from == k_lt ? in.lt : in.rt;
+      } else {
+        value = (in.buttons & ButtonOf(from)) ? 255 : 0;
+      }
+      if (b.control == k_lt || b.control == k_rt) {
+        uint8_t& trigger = b.control == k_lt ? out.lt : out.rt;
+        trigger = std::max(trigger, value);
+      } else if (value > kTriggerThreshold) {
+        out.buttons |= ButtonOf(b.control);
+      }
+    }
+    return out;
+  }
+
+  // A physical button's name as its control (k_a for "A"), or `fallback`.
+  static uint32_t PhysicalControl(const std::string& name, uint32_t fallback) {
+    static const std::pair<const char*, uint32_t> kNames[] = {
+#define TENCHUZ_PAD_NAME(id, button) {button, k_##id},
+        TENCHUZ_PAD_ACTIONS(TENCHUZ_PAD_NAME)
+#undef TENCHUZ_PAD_NAME
+    };
+    for (const auto& [n, control] : kNames) {
+      if (name == n) return control;
+    }
+    return fallback;
+  }
 
   // Another controller's state into `pad`: buttons and triggers combine, and
   // each stick takes the larger deflection.
@@ -524,6 +603,7 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
         continue;
       }
       if (what.starts_with("shot:") || what == "dump" || what == "memdump" || what == "skip2d" || what == "profile" || what.starts_with("menu") ||
+          what.starts_with("set:") || what == "gpuprofile" || what == "framedump" ||
           what == "quit") {
         const size_t c = what.find(':');
         step.command = std::string(what.substr(0, c));
@@ -620,6 +700,15 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
           game_menu::RequestToggle();
         }).detach();
       }
+    } else if (step.command == "framedump") {  // the next 3 frames, all of memory
+      debug_tools::RequestFrameDumps(3);
+    } else if (step.command == "gpuprofile") {
+      native::RequestGpuProfile();
+    } else if (step.command == "set") {  // set:<setting>=<value>, as the game menu would
+      const size_t equals = step.argument.find('=');
+      if (equals != std::string::npos) {
+        rex::cvar::SetFlagByName(step.argument.substr(0, equals), step.argument.substr(equals + 1));
+      }
     } else if (step.command == "quit") {
       std::_Exit(0);
     }
@@ -633,6 +722,10 @@ class Input final : public rex::ui::WindowInputListener, public rex::ui::WindowL
   std::array<uint32_t, 2> wheel_polls_{};
   float mouse_dx_ = 0, mouse_dy_ = 0;
   double smooth_x_ = 0, smooth_y_ = 0;
+  // Game thread only (Poll and the sub_8228C7D8 hook).
+  static constexpr float kMaxLook = 32.0f;
+  float look_x_ = 0, look_y_ = 0;
+  bool look_active_ = false;
   std::atomic<bool> focused_{false};
   std::atomic<bool> menu_open_{false};
   std::atomic<bool> mouse_captured_{false};
@@ -769,6 +862,48 @@ const std::vector<Control>& Controls() { return g_controls; }
 
 std::string Binding(const char* id) { return rex::cvar::GetFlagByName(std::string("tenchuz_key_") + id); }
 
+const std::vector<Control>& PadActions() {
+  static const std::vector<Control> actions = [] {
+    std::vector<Control> out;
+    for (const char* id : {
+#define TENCHUZ_PAD_ID(id, button) #id,
+             TENCHUZ_PAD_ACTIONS(TENCHUZ_PAD_ID)
+#undef TENCHUZ_PAD_ID
+         }) {
+      if (const ControlDef* def = FindControl(id)) out.push_back(def->control);
+    }
+    return out;
+  }();
+  return actions;
+}
+
+const std::vector<const char*>& PadButtons() {
+  static const std::vector<const char*> buttons = {
+#define TENCHUZ_PAD_BUTTON(id, button) button,
+      TENCHUZ_PAD_ACTIONS(TENCHUZ_PAD_BUTTON)
+#undef TENCHUZ_PAD_BUTTON
+  };
+  return buttons;
+}
+
+std::string PadBinding(const char* id) { return rex::cvar::GetFlagByName(std::string("tenchuz_pad_") + id); }
+
+void SetPadBinding(const char* id, const std::string& button) {
+  rex::cvar::SetFlagByName(std::string("tenchuz_pad_") + id, button);
+}
+
+std::string DefaultPadBinding(const char* id) {
+  static const std::pair<const char*, const char*> kDefaults[] = {
+#define TENCHUZ_PAD_DEFAULT(id, button) {#id, button},
+      TENCHUZ_PAD_ACTIONS(TENCHUZ_PAD_DEFAULT)
+#undef TENCHUZ_PAD_DEFAULT
+  };
+  for (const auto& [action, button] : kDefaults) {
+    if (std::strcmp(action, id) == 0) return button;
+  }
+  return {};
+}
+
 void SetBinding(const char* id, const std::string& keys) {
   rex::cvar::SetFlagByName(std::string("tenchuz_key_") + id, keys);
   g_input.RebuildBindings();
@@ -796,4 +931,57 @@ REX_HOOK_RAW(sub_824103F8) {
   const uint32_t state = ctx.r4.u32;
   __imp__sub_824103F8(ctx, base);
   ctx.r3.u64 = tenchuz::input::g_input.Poll(base, user, state, ctx.r3.u32);
+}
+
+REX_EXTERN(__imp__sub_8228C7D8);
+// The game's pad update: reads the four pads through XInputGetState into
+// blocks of 192 bytes at 0x82B57470, with the sticks as floats past the dead
+// zone (-1 to 1) at +36 LX, +40 LY, +44 RX, +48 RY. Pad 0's right stick
+// takes the mouse's value, which goes past 1 for a faster camera.
+REX_HOOK_RAW(sub_8228C7D8) {
+  __imp__sub_8228C7D8(ctx, base);
+  float x, y;
+  if (!tenchuz::input::g_input.MouseLook(x, y)) return;
+  constexpr uint32_t kPad0RightStick = 0x82B57470 + 44;
+  uint32_t bits;
+  std::memcpy(&bits, &x, 4);
+  REX_STORE_U32(kPad0RightStick, bits);
+  std::memcpy(&bits, &y, 4);
+  REX_STORE_U32(kPad0RightStick + 4, bits);
+}
+
+
+// The follow camera (state sub_823E38D0, camera object in r3) turns by its
+// stick (RX at +340, RY at +344) through these two: yaw (+292) and pitch
+// (+288) move by 1e-5 * speed * frame ms, where the speed (+360, +364) grows
+// by the frame time each frame up to 200 * |stick|. That ramp is for thumb
+// sticks; a mouse flick is over before it gets going. With the mouse, the
+// speed starts at its ceiling, so the camera turns with the mouse's own
+// speed and the angle follows the distance moved.
+namespace {
+constexpr float kCameraSpeedPerStick = 200.0f;  // 0x8200BEC8
+
+void SkipCameraRamp(uint8_t* base, uint32_t camera, uint32_t stick, uint32_t speed) {
+  float x, y;
+  if (!tenchuz::input::g_input.MouseLook(x, y)) return;
+  const uint32_t bits = REX_LOAD_U32(camera + stick);
+  float value;
+  std::memcpy(&value, &bits, 4);
+  const float ceiling = std::abs(value) * kCameraSpeedPerStick;
+  uint32_t out;
+  std::memcpy(&out, &ceiling, 4);
+  REX_STORE_U32(camera + speed, out);
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_823E1A20);
+REX_HOOK_RAW(sub_823E1A20) {  // the follow camera's yaw
+  SkipCameraRamp(base, ctx.r3.u32, 340, 360);
+  __imp__sub_823E1A20(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_823E1C58);
+REX_HOOK_RAW(sub_823E1C58) {  // the follow camera's pitch
+  SkipCameraRamp(base, ctx.r3.u32, 344, 364);
+  __imp__sub_823E1C58(ctx, base);
 }

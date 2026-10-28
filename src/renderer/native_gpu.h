@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 
 namespace rex::system {
@@ -28,5 +29,9 @@ std::unique_ptr<rex::system::IGraphicsSystem> CreateNativeGraphicsSystem();
 // The guest vblank rate in Hz (0: the video mode's, 60). The D3D paces frames
 // in vblanks, so frame_rate.cpp raises it for frame rates above 60.
 void SetVblankRate(double hz);
+
+// Display vblanks counted while the game's vblanks follow the display's
+// (tenchuz_display_vblank): 0 while they're on a timer.
+uint64_t DisplayVblanks();
 
 }  // namespace tenchuz::native

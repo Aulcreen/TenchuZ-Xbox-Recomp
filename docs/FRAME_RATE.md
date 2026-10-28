@@ -23,6 +23,9 @@
   keep interval 2, so it animates at the original speed.
 - Still per frame at the full rate: the village prompts' quick fade-in ("Accept mission"). No
   single game flag marks them: a diff of the game's globals found none.
+- **Above 60 fps: removed (2026-10-28).** Blood sprays hang in the air at 120 (fine at 60, from
+  a player report): some effects step per frame. The cap is 30 or 60 again; settings asking for
+  more run at 60. What follows describes the removed option.
 - **Above 60 fps (2026-10-21):** `--tenchuz_frame_rate` (or the Esc menu) takes 120, 144, 165,
   180 or 240. The D3D paces frames in guest vblanks, so in 3D scenes the native GPU raises them at
   that rate (`native::SetVblankRate`) with interval 1; 2D screens and the pause menu go back to
@@ -30,6 +33,19 @@
 - **Pacing:** the process now runs at 1 ms timer resolution (`timeBeginPeriod`), and the
   vblank thread waits on a high-resolution waitable timer. Before, `Sleep(1)` slept a 15.6 ms
   scheduler tick, so vblanks arrived in bursts and frames topped out near 64 fps.
+- **Vblanks from the display (2026-10-28):** on a display at a multiple of 60 Hz (60, 120, 180,
+  240), the native GPU raises the guest vblank on every Nth display vblank (`IDXGIOutput::
+  WaitForVBlank`, `tenchuz_display_vblank`), a third of a refresh later. The game hands each
+  frame over about 1 ms after its vblank. On its own timer, 60 Hz drifted against a 180 Hz
+  display and handovers fell right on refresh boundaries, so frames stayed up for 2 or 4
+  refreshes instead of 3: judder when panning the camera (a player report). Measured over
+  600-frame windows (`frames shown for ... refreshes` in the log): about 1 frame in 5 was 2 or 4
+  before, and 598-600 of 600 are 3 now, in the village and Mission 1. Other rates (144 Hz) keep
+  the timer. `WaitForVBlank` sometimes returns at once while loading; those returns are ignored.
+- **Menu sprites at 60 fps:** `sub_823FC238` (a menu or HUD sprite's update: a pulse and a
+  slide-in countdown) also queues the sprite's draw. Running it every other frame for its 30 Hz
+  pulse made the menus' kunai cursor blink on 60 fps screens (character settings). It now runs
+  every frame and puts its pulse and countdown back on the in-between frames.
 - **Fixed 1/30 s steps:** effect objects add the constant `0x821DBCA8` (1/30) to timers each
   frame, in 8 methods at `0x823EBF90`-`0x82408938`. At 60 fps the constant is rewritten each
   frame to the measured frame time (`0x82B577BC`).

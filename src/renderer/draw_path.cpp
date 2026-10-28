@@ -14,12 +14,16 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <rex/bit.h>
@@ -36,6 +40,8 @@
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_INT32(tenchuz_native_anisotropy, 16, "tenchuz",
+                     "Anisotropic filtering for the game's mipmapped textures: 0 = the game's own, 2, 4, 8 or 16");
 REXCVAR_DEFINE_BOOL(tenchuz_native_ring_flush, false, "tenchuz",
                     "Native draws: flush mid-frame when command-ring vertex pages are rewritten");
 REXCVAR_DEFINE_BOOL(tenchuz_native_geometry_watch, true, "tenchuz",
@@ -171,9 +177,17 @@ D3D12_SAMPLER_DESC SamplerDesc(const gfx::DxbcShader::SamplerBinding& binding,
                                  ? fetch.aniso_filter
                                  : binding.aniso_filter;
   aniso = std::min(aniso, xenos::AnisoFilter::kMax_16_1);
-  if (aniso != xenos::AnisoFilter::kDisabled) {
+  uint32_t max_anisotropy = aniso != xenos::AnisoFilter::kDisabled ? 1u << (uint32_t(aniso) - 1) : 1;
+  // --tenchuz_native_anisotropy raises it for linear, mipmapped textures (the
+  // 3D scene's); point-sampled and unmipmapped ones (2D, resolves) keep theirs.
+  const int32_t forced = std::clamp(REXCVAR_GET(tenchuz_native_anisotropy), 0, 16);
+  if (forced > 1 && min == xenos::TextureFilter::kLinear && mag == xenos::TextureFilter::kLinear &&
+      !mip_base_map && mip_max_level > mip_min_level) {
+    max_anisotropy = std::max(max_anisotropy, uint32_t(forced));
+  }
+  if (max_anisotropy > 1) {
     desc.Filter = D3D12_FILTER_ANISOTROPIC;
-    desc.MaxAnisotropy = 1u << (uint32_t(aniso) - 1);
+    desc.MaxAnisotropy = max_anisotropy;
   } else {
     auto type = [](bool linear) { return linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT; };
     desc.Filter = D3D12_ENCODE_BASIC_FILTER(type(min == xenos::TextureFilter::kLinear),
@@ -461,7 +475,68 @@ struct DrawPath::Impl {
     copy_checks.push_back({record, address, size, XXH3_64bits(REX_RAW_ADDR(0xA0000000u | address), size), kind});
   }
 
+  // Texture views made once and copied into each draw's table after, rather
+  // than made through the driver for every binding of every draw. Keyed by
+  // the texture and the view; each entry holds its texture, so its address
+  // can't come back as another texture's. Evicted entries (least recently
+  // used, past kViewCacheSize) keep their textures until the GPU is done with
+  // the frames that may still read them (Frame::retired).
+  static constexpr uint32_t kViewCacheSize = 4096;
+  ComPtr<ID3D12DescriptorHeap> view_cache_heap;  // CPU only
+  struct CachedView {
+    uint32_t index = 0;  // in view_cache_heap
+    ComPtr<ID3D12Resource> resource;
+    uint64_t last_used = 0;
+  };
+  std::unordered_map<uint64_t, CachedView> view_cache;
+  std::vector<uint32_t> view_cache_free;
+  uint64_t view_cache_clock = 0;
+
+  // Writes a view of `resource` described by `view` at `cpu`, from the cache.
+  void CreateTextureView(ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC& view,
+                         D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
+    if (!view_cache_heap) {
+      device->CreateShaderResourceView(resource, &view, cpu);
+      return;
+    }
+    const uint64_t key = XXH3_64bits(&view, sizeof(view)) * 0x9E3779B97F4A7C15ull ^ uint64_t(uintptr_t(resource));
+    auto it = view_cache.find(key);
+    if (it == view_cache.end() || it->second.resource.Get() != resource) {
+      if (it != view_cache.end()) {  // a hash collision: replaced
+        frames[slot].retired.push_back(std::move(it->second.resource));
+        view_cache_free.push_back(it->second.index);
+        view_cache.erase(it);
+      }
+      if (view_cache_free.empty()) {
+        // Full: the least recently used half goes.
+        std::vector<std::pair<uint64_t, uint64_t>> ages;
+        ages.reserve(view_cache.size());
+        for (const auto& [k, v] : view_cache) ages.emplace_back(v.last_used, k);
+        std::nth_element(ages.begin(), ages.begin() + ages.size() / 2, ages.end());
+        for (size_t i = 0; i < ages.size() / 2; ++i) {
+          auto old = view_cache.find(ages[i].second);
+          frames[slot].retired.push_back(std::move(old->second.resource));
+          view_cache_free.push_back(old->second.index);
+          view_cache.erase(old);
+        }
+      }
+      CachedView entry;
+      entry.index = view_cache_free.back();
+      view_cache_free.pop_back();
+      entry.resource = resource;
+      D3D12_CPU_DESCRIPTOR_HANDLE at = view_cache_heap->GetCPUDescriptorHandleForHeapStart();
+      at.ptr += SIZE_T(entry.index) * view_inc;
+      device->CreateShaderResourceView(resource, &view, at);
+      it = view_cache.emplace(key, std::move(entry)).first;
+    }
+    it->second.last_used = ++view_cache_clock;
+    D3D12_CPU_DESCRIPTOR_HANDLE from = view_cache_heap->GetCPUDescriptorHandleForHeapStart();
+    from.ptr += SIZE_T(it->second.index) * view_inc;
+    device->CopyDescriptorsSimple(1, cpu, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  }
+
   struct Frame {
+    std::vector<ComPtr<ID3D12Resource>> retired;  // evicted cached views' textures, freed when the GPU is done
     ComPtr<ID3D12Resource> constants;
     uint8_t* constants_map = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS constants_gpu = 0;
@@ -553,6 +628,84 @@ struct DrawPath::Impl {
   const uint64_t* query_map = nullptr;
   std::array<uint32_t, kFrames> queries_used{};
   std::array<bool, kFrames> log_pending{};
+  bool stencil_missing = false;  // TakeStencilMissing
+
+  // GPU profile (RequestProfile): timestamp 0 at the frame's first record,
+  // then one after each record, in the same order as records[slot].
+  static constexpr uint32_t kTimestampsPerFrame = 8192;
+  ComPtr<ID3D12QueryHeap> timestamp_heap;
+  ComPtr<ID3D12Resource> timestamp_readback;
+  const uint64_t* timestamp_map = nullptr;
+  uint64_t timestamp_frequency = 0;
+  std::atomic<bool> profile_requested{false};
+  std::array<bool, kFrames> profiling{};        // this slot's frame is being profiled
+  std::array<bool, kFrames> profile_resolved{};  // ... and its timestamps were resolved
+  std::array<uint32_t, kFrames> timestamps_used{};
+  ID3D12GraphicsCommandList* timestamp_list = nullptr;
+
+  void Timestamp(ID3D12GraphicsCommandList* list) {
+    if (!profiling[slot] || timestamps_used[slot] >= kTimestampsPerFrame) return;
+    list->EndQuery(timestamp_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                   slot * kTimestampsPerFrame + timestamps_used[slot]++);
+    timestamp_list = list;
+  }
+
+  // Logs the slot's profile: GPU time per render target, per operation, and
+  // the slowest draws. Runs once the slot's GPU work has finished.
+  void LogProfile(uint32_t s) {
+    const uint32_t used = timestamps_used[s];
+    const auto& list = records[s];
+    if (!profile_resolved[s] || used < 2 || !timestamp_frequency) {
+      REXLOG_INFO("tenchuz: NATIVE GPU profile: no timestamps (frame not presented?)");
+      return;
+    }
+    const uint64_t* ts = timestamp_map + uint64_t(s) * kTimestampsPerFrame;
+    const double to_ms = 1000.0 / double(timestamp_frequency);
+    const uint32_t n = std::min<uint32_t>(used - 1, uint32_t(list.size()));
+    struct Group {
+      double ms = 0;
+      uint32_t count = 0;
+    };
+    std::map<std::string, Group> by_target, by_op;
+    std::vector<std::pair<double, uint32_t>> draws;
+    double total = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      const double ms = ts[i + 1] >= ts[i] ? double(ts[i + 1] - ts[i]) * to_ms : 0.0;
+      total += ms;
+      const DrawRecord& r = list[i];
+      if (r.op) {
+        Group& g = by_op[r.op];
+        g.ms += ms;
+        ++g.count;
+        continue;
+      }
+      Group& g = by_target[fmt::format("{}x{} x{} {}", r.target_width, r.target_height, r.samples,
+                                       r.depth_test ? "3D" : "2D")];
+      g.ms += ms;
+      ++g.count;
+      draws.emplace_back(ms, i);
+    }
+    REXLOG_INFO("tenchuz: NATIVE GPU profile of frame {}: {:.2f} ms on the GPU over {} draws and operations",
+                record_frames[s], total, n);
+    auto log_groups = [&](const char* what, std::map<std::string, Group>& groups) {
+      std::vector<std::pair<std::string, Group>> sorted(groups.begin(), groups.end());
+      std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+      for (const auto& [name, g] : sorted) {
+        REXLOG_INFO("tenchuz: NATIVE GPU profile   {} {}: {:.2f} ms ({:.0f}%), {}", what, name, g.ms,
+                    total > 0 ? 100.0 * g.ms / total : 0.0, g.count);
+      }
+    };
+    log_groups("target", by_target);
+    log_groups("operation", by_op);
+    std::sort(draws.begin(), draws.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t k = 0; k < std::min<size_t>(draws.size(), 12); ++k) {
+      const DrawRecord& r = list[draws[k].second];
+      REXLOG_INFO("tenchuz: NATIVE GPU profile   draw #{}: {:.3f} ms, vs {:08X} ps {:08X}, {} {} on {}x{} x{}{}",
+                  draws[k].second, draws[k].first, uint32_t(r.vs), uint32_t(r.ps), r.count,
+                  r.indexed ? "indices" : "vertices", r.target_width, r.target_height, r.samples,
+                  r.depth_test ? " depth" : "");
+    }
+  }
   std::array<uint64_t, kFrames> log_frame{};
   std::array<uint64_t, kFrames> query_frame{};  // frame number of each slot's queries
   std::array<uint64_t, kFrames> record_frames{};
@@ -605,6 +758,7 @@ struct DrawPath::Impl {
       records[slot].push_back(record);
       number = uint32_t(records[slot].size());
     }
+    if (number == 1) Timestamp(list);  // the frame's start
     if (breadcrumb_list2) {
       const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER started = {breadcrumbs_gpu + 8 * slot, number};
       const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
@@ -614,6 +768,7 @@ struct DrawPath::Impl {
   }
 
   void MarkEnd(uint32_t number) {
+    if (number && breadcrumb_list) Timestamp(breadcrumb_list);
     if (breadcrumb_list2 && number) {
       const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER completed = {breadcrumbs_gpu + 8 * slot + 4, number};
       const D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
@@ -626,6 +781,98 @@ struct DrawPath::Impl {
 
   std::unordered_map<uint32_t, ComPtr<ID3D12RootSignature>> root_signatures;
   std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> pipelines;
+
+  // Compiled pipelines kept between runs (ID3D12PipelineLibrary): a new
+  // pipeline costs the driver's shader compile once (up to a few hundred ms,
+  // a visible hitch), and loads from the library in well under a millisecond
+  // after. Named by a hash of everything in its description; saved at most
+  // every 30 s while new ones come in, and at exit.
+  ComPtr<ID3D12PipelineLibrary> pipeline_library;
+  std::vector<uint8_t> pipeline_library_blob;  // the library reads from it while it lives
+  std::filesystem::path pipeline_library_path;
+  uint32_t pipelines_stored = 0;  // since the last save
+  std::chrono::steady_clock::time_point pipeline_library_saved = std::chrono::steady_clock::now();
+
+  void OpenPipelineLibrary(const std::filesystem::path& path) {
+    ComPtr<ID3D12Device1> device1;
+    if (path.empty() || FAILED(device->QueryInterface(IID_PPV_ARGS(&device1)))) {
+      return;
+    }
+    pipeline_library_path = path;
+    if (FILE* file = _wfopen(path.c_str(), L"rb")) {
+      std::fseek(file, 0, SEEK_END);
+      const long size = std::ftell(file);
+      std::fseek(file, 0, SEEK_SET);
+      if (size > 0) {
+        pipeline_library_blob.resize(size_t(size));
+        if (std::fread(pipeline_library_blob.data(), 1, size_t(size), file) != size_t(size)) {
+          pipeline_library_blob.clear();
+        }
+      }
+      std::fclose(file);
+    }
+    HRESULT hr = E_FAIL;
+    if (!pipeline_library_blob.empty()) {
+      hr = device1->CreatePipelineLibrary(pipeline_library_blob.data(), pipeline_library_blob.size(),
+                                          IID_PPV_ARGS(&pipeline_library));
+      if (FAILED(hr)) {  // a new driver or GPU: start over
+        REXLOG_INFO("tenchuz: N4 pipeline cache {} not usable ({:08X}); starting a new one", path.string(),
+                    uint32_t(hr));
+        pipeline_library_blob.clear();
+      }
+    }
+    if (FAILED(hr)) {
+      hr = device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&pipeline_library));
+    }
+    if (FAILED(hr)) {
+      pipeline_library.Reset();
+      REXLOG_WARN("tenchuz: N4 no pipeline cache ({:08X})", uint32_t(hr));
+      return;
+    }
+    REXLOG_INFO("tenchuz: N4 pipeline cache {} ({} KB)", path.string(), pipeline_library_blob.size() >> 10);
+  }
+
+  void SavePipelineLibrary() {
+    if (!pipeline_library || !pipelines_stored) {
+      return;
+    }
+    std::vector<uint8_t> data(pipeline_library->GetSerializedSize());
+    if (data.empty() || FAILED(pipeline_library->Serialize(data.data(), data.size()))) {
+      return;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(pipeline_library_path.parent_path(), error);
+    const std::filesystem::path temp = pipeline_library_path.wstring() + L".tmp";
+    if (FILE* file = _wfopen(temp.c_str(), L"wb")) {
+      const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
+      std::fclose(file);
+      if (ok) {
+        std::filesystem::rename(temp, pipeline_library_path, error);
+      }
+    }
+    pipelines_stored = 0;
+    pipeline_library_saved = std::chrono::steady_clock::now();
+  }
+
+  static uint64_t PipelineName(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC state = desc;  // without the pointers
+    state.pRootSignature = nullptr;
+    state.VS = state.PS = state.GS = state.DS = state.HS = {};
+    state.InputLayout = {};
+    state.StreamOutput = {};
+    uint64_t name = XXH3_64bits(&state, sizeof(state));
+    for (const D3D12_SHADER_BYTECODE& code : {desc.VS, desc.PS, desc.GS}) {
+      name = name * 0x9E3779B97F4A7C15ull ^ (code.BytecodeLength ? XXH3_64bits(code.pShaderBytecode, code.BytecodeLength) : 0);
+    }
+    for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+      const D3D12_INPUT_ELEMENT_DESC& e = desc.InputLayout.pInputElementDescs[i];
+      name = name * 0x9E3779B97F4A7C15ull ^ XXH3_64bits(e.SemanticName, std::strlen(e.SemanticName));
+      const uint32_t fields[] = {e.SemanticIndex, uint32_t(e.Format), e.InputSlot, e.AlignedByteOffset,
+                                 uint32_t(e.InputSlotClass), e.InstanceDataStepRate};
+      name = name * 0x9E3779B97F4A7C15ull ^ XXH3_64bits(fields, sizeof(fields));
+    }
+    return name;
+  }
   DrawStats stats;
   std::unordered_set<uint64_t> logged_fetches;  // --tenchuz_native_log_textures
   uint32_t draw_textures[6] = {};  // the current draw's bound textures (DrawRecord::textures)
@@ -688,6 +935,14 @@ struct DrawPath::Impl {
     heap.NumDescriptors = 3;
     heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
     if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&staging_heap)))) return false;
+    {
+      D3D12_DESCRIPTOR_HEAP_DESC cache = {};
+      cache.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+      cache.NumDescriptors = kViewCacheSize;
+      if (SUCCEEDED(device->CreateDescriptorHeap(&cache, IID_PPV_ARGS(&view_cache_heap)))) {
+        for (uint32_t i = kViewCacheSize; i-- > 0;) view_cache_free.push_back(i);
+      }
+    }
     view_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     // Shared memory SRV (raw) and a null UAV (memexport is not supported yet).
@@ -792,6 +1047,22 @@ struct DrawPath::Impl {
       breadcrumbs_map = static_cast<volatile uint32_t*>(mapped);
       breadcrumbs_gpu = breadcrumbs->GetGPUVirtualAddress();
       SetDebugName(breadcrumbs.Get(), "tenchuz breadcrumbs");
+    }
+
+    {
+      D3D12_QUERY_HEAP_DESC qd = {D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kTimestampsPerFrame * kFrames, 0};
+      const D3D12_RESOURCE_DESC rd = buffer_desc(uint64_t(kTimestampsPerFrame) * kFrames * 8);
+      if (SUCCEEDED(device->CreateQueryHeap(&qd, IID_PPV_ARGS(&timestamp_heap))) &&
+          SUCCEEDED(device->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesReadback,
+                                                    D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                    nullptr, IID_PPV_ARGS(&timestamp_readback)))) {
+        void* mapped = nullptr;
+        D3D12_RANGE all = {0, SIZE_T(rd.Width)};
+        timestamp_readback->Map(0, &all, &mapped);
+        timestamp_map = static_cast<const uint64_t*>(mapped);
+      } else {
+        timestamp_heap.Reset();
+      }
     }
 
     if (REXCVAR_GET(tenchuz_native_draw_queries)) {
@@ -1117,7 +1388,7 @@ struct DrawPath::Impl {
       ds.DepthEnable = depth.z_enable;
       ds.DepthWriteMask = depth.z_write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
       ds.DepthFunc = D3D12_COMPARISON_FUNC(uint32_t(depth.zfunc) + 1);
-      if (depth.stencil_enable) {
+      if (depth.stencil_enable && target.depth_format != DXGI_FORMAT_D32_FLOAT) {
         ds.StencilEnable = TRUE;
         ds.StencilReadMask = UINT8(stencil.stencilmask);
         ds.StencilWriteMask = UINT8(stencil.stencilwritemask);
@@ -1135,7 +1406,21 @@ struct DrawPath::Impl {
     desc.SampleDesc.Count = target.samples;
     ComPtr<ID3D12PipelineState> pso;
     const auto pso_start = std::chrono::steady_clock::now();
-    const HRESULT hr = CreatePipelineGuarded(device, desc, pso.ReleaseAndGetAddressOf());
+    wchar_t library_name[24] = {};
+    HRESULT hr = E_FAIL;
+    if (pipeline_library) {
+      std::swprintf(library_name, 24, L"p%016llX", static_cast<unsigned long long>(PipelineName(desc)));
+      hr = pipeline_library->LoadGraphicsPipeline(library_name, &desc, IID_PPV_ARGS(pso.ReleaseAndGetAddressOf()));
+      if (SUCCEEDED(hr)) {
+        ++stats.pipelines_loaded;
+      }
+    }
+    if (FAILED(hr)) {
+      hr = CreatePipelineGuarded(device, desc, pso.ReleaseAndGetAddressOf());
+      if (SUCCEEDED(hr) && pipeline_library && SUCCEEDED(pipeline_library->StorePipeline(library_name, pso.Get()))) {
+        ++pipelines_stored;
+      }
+    }
     const double pso_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pso_start).count();
     ++stats.pipelines_created;
     stats.pipeline_ms += pso_ms;
@@ -1329,7 +1614,7 @@ struct DrawPath::Impl {
                                        D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
         view.Texture2DArray.MipLevels = 1;
         view.Texture2DArray.ArraySize = 1;
-        device->CreateShaderResourceView(texture.resource, &view, cpu);
+        CreateTextureView(texture.resource, view, cpu);
         if (texture.resolution_scaled) {
           resolution_scaled |= 1u << binding.fetch_constant;
         }
@@ -1397,7 +1682,7 @@ struct DrawPath::Impl {
         view.TextureCube.MipLevels = texture.mip_levels;
         break;
     }
-    device->CreateShaderResourceView(texture.resource, &view, cpu);
+    CreateTextureView(texture.resource, view, cpu);
     ++stats.textures_guest;
     if (draw_texture_count < 6) draw_textures[draw_texture_count++] = fetch.base_address << 12;
     if (REXCVAR_GET(tenchuz_native_log_textures)) {
@@ -1506,10 +1791,17 @@ struct DrawPath::Impl {
 };
 
 DrawPath::DrawPath() : impl_(std::make_unique<Impl>()) {}
-DrawPath::~DrawPath() = default;
+DrawPath::~DrawPath() {
+  impl_->SavePipelineLibrary();
+}
 
-bool DrawPath::Initialize(ID3D12Device* device, rex::memory::Memory* memory) {
-  return impl_->Initialize(device, memory);
+bool DrawPath::Initialize(ID3D12Device* device, rex::memory::Memory* memory,
+                          const std::filesystem::path& pipeline_cache) {
+  if (!impl_->Initialize(device, memory)) {
+    return false;
+  }
+  impl_->OpenPipelineLibrary(pipeline_cache);
+  return true;
 }
 
 uint32_t DrawPath::WrittenColorMask(const pm4::Decoder& state, uint8_t* base, uint32_t device_address,
@@ -1539,6 +1831,20 @@ uint32_t DrawPath::WrittenColorMask(const pm4::Decoder& state, uint8_t* base, ui
 
 void DrawPath::BeginFrame(uint32_t slot) {
   impl_->slot = slot % kFrames;
+  impl_->frames[impl_->slot].retired.clear();
+  if (impl_->pipelines_stored &&
+      std::chrono::steady_clock::now() - impl_->pipeline_library_saved > std::chrono::seconds(30)) {
+    impl_->SavePipelineLibrary();
+  }
+  if (impl_->profiling[impl_->slot]) {
+    impl_->LogProfile(impl_->slot);  // the slot's GPU work has finished
+    impl_->profiling[impl_->slot] = false;
+  }
+  impl_->profile_resolved[impl_->slot] = false;
+  impl_->timestamps_used[impl_->slot] = 0;
+  if (impl_->timestamp_heap && impl_->profile_requested.exchange(false)) {
+    impl_->profiling[impl_->slot] = true;
+  }
   if (impl_->log_pending[impl_->slot]) {
     impl_->log_pending[impl_->slot] = false;
     impl_->LogDraws(impl_->slot);  // the slot's GPU work has finished: query results are in
@@ -1614,6 +1920,21 @@ void DrawPath::EndFrame(ID3D12GraphicsCommandList* list, uint64_t frame) {
     list->ResolveQueryData(m.query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, first, m.queries_used[m.slot],
                            m.query_readback.Get(), uint64_t(first) * 8);
   }
+}
+
+void DrawPath::SetTimestampFrequency(uint64_t ticks_per_second) { impl_->timestamp_frequency = ticks_per_second; }
+
+void DrawPath::RequestProfile() { impl_->profile_requested = true; }
+
+bool DrawPath::TakeStencilMissing() { return std::exchange(impl_->stencil_missing, false); }
+
+void DrawPath::ResolveProfile(ID3D12GraphicsCommandList* list) {
+  Impl& m = *impl_;
+  if (!m.profiling[m.slot] || !m.timestamps_used[m.slot]) return;
+  const uint32_t first = m.slot * Impl::kTimestampsPerFrame;
+  list->ResolveQueryData(m.timestamp_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, first, m.timestamps_used[m.slot],
+                         m.timestamp_readback.Get(), uint64_t(first) * 8);
+  m.profile_resolved[m.slot] = true;
 }
 
 void DrawPath::ReportHang() {
@@ -2104,7 +2425,9 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
                            target.depth_format != DXGI_FORMAT_UNKNOWN ? &target.dsv : nullptr);
   if (target.depth_format != DXGI_FORMAT_UNKNOWN) {
     const reg::RB_DEPTHCONTROL depth = NormalizedDepthControl(regs);
-    if (depth.stencil_enable) {
+    if (depth.stencil_enable && target.depth_format == DXGI_FORMAT_D32_FLOAT) {
+      m.stencil_missing = true;  // drawn without the test; the renderer adds stencil from the next frame
+    } else if (depth.stencil_enable) {
       list->OMSetStencilRef(
           StencilRefMask(regs, depth, topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE).stencilref);
       ++m.stats.stencil_draws;

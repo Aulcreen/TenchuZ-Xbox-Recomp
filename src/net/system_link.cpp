@@ -1145,6 +1145,7 @@ void StartSteam() {}
 bool SteamReady() { return false; }
 OnlineStatus GetOnlineStatus() { return {}; }
 void JoinFriend(uint64_t) {}
+void JoinLobby(uint64_t) {}
 void InviteFriend(uint64_t) {}
 #endif
 

@@ -4,8 +4,9 @@
 // 16/9 at 0x8200B73C. The startup display setup (sub_822A6AE8) copies it to the
 // display aspect (0x829BF1B4) that camera init reads (sub_822A6C30 via
 // sub_823E0F90), and four rendering functions load it directly.
-// --tenchuz_aspect_ratio replaces it before the game starts, and the native
-// renderer presents at that aspect.
+// --tenchuz_aspect_ratio replaces it before the game starts and, when it
+// changes, there and in those copies (Update); the native renderer presents
+// at that aspect.
 
 #pragma once
 
@@ -26,5 +27,8 @@ float HudScaleX();
 
 // Writes the aspect ratio into the game image (after it's loaded, before it runs).
 void PatchGame(uint8_t* virtual_membase);
+
+// Once per main-loop frame: applies a changed --tenchuz_aspect_ratio.
+void Update(uint8_t* virtual_membase);
 
 }  // namespace tenchuz::widescreen

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 
@@ -100,6 +101,7 @@ enum PlaceholderReason : uint32_t {
 };
 
 struct DrawStats {
+  uint32_t pipelines_loaded = 0;  // of pipelines_created: from the pipeline cache, not compiled
   uint32_t issued = 0;
   uint32_t skipped_primitive = 0;  // primitive types not handled yet (fans, rect lists, quads)
   uint32_t skipped_primitive_types = 0;  // bit per xenos::PrimitiveType skipped
@@ -140,7 +142,10 @@ class DrawPath {
   ~DrawPath();
 
   // `memory`: guest memory, for texture write watching (null: hash instead).
-  bool Initialize(ID3D12Device* device, rex::memory::Memory* memory);
+  // `pipeline_cache`: the file compiled pipelines are kept in between runs
+  // (empty: none).
+  bool Initialize(ID3D12Device* device, rex::memory::Memory* memory,
+                  const std::filesystem::path& pipeline_cache = {});
 
   // The colour components a draw writes, 4 bits per render target (SDK
   // draw_util::GetNormalizedColorMask): targets the pixel shader writes, with
@@ -171,6 +176,18 @@ class DrawPath {
 
   // Before the frame's command list is closed: resolves its draw queries.
   void EndFrame(ID3D12GraphicsCommandList* list, uint64_t frame);
+
+  // GPU profile of one frame: a timestamp after every draw and operation,
+  // logged once the GPU has finished it as GPU time per render target and per
+  // operation. Request it before the frame starts; `ResolveProfile` goes at
+  // the end of the frame's last command list (the present).
+  void SetTimestampFrequency(uint64_t ticks_per_second);
+  void RequestProfile();
+  void ResolveProfile(ID3D12GraphicsCommandList* list);
+
+  // Whether a draw has asked for the stencil test on a depth buffer without
+  // stencil (D32_FLOAT) since the last call; such draws run without it.
+  bool TakeStencilMissing();
 
   // Logs the draws the GPU had started but not finished (breadcrumbs written
   // around every draw), after the device was removed for a hang. Runs once.
