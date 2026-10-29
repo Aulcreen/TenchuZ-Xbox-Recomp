@@ -59,6 +59,8 @@ REXCVAR_DEFINE_BOOL(tenchuz_native_draw_queries, false, "tenchuz",
                     "Native draws: occlusion query per draw, listed with tenchuz_native_log_draws");
 REXCVAR_DEFINE_BOOL(tenchuz_native_debug_textures, false, "tenchuz",
                     "Native draws sample a UV-gradient checker instead of white (geometry check)");
+REXCVAR_DEFINE_BOOL(tenchuz_native_alpha_test_tolerance, true, "tenchuz",
+                    "Compare alpha tests at 8-bit precision (fixes speckled characters on NVIDIA and other GPUs)");
 REXCVAR_DEFINE_BOOL(tenchuz_native_log_textures, false, "tenchuz",
                     "Native draws: log each distinct texture fetch once, with how it was bound and any "
                     "resolve destination a guest texture overlaps");
@@ -1499,6 +1501,18 @@ struct DrawPath::Impl {
     float alpha_ref;
     const uint32_t alpha_ref_bits = regs[gfx::XE_GPU_REG_RB_ALPHA_REF];
     std::memcpy(&alpha_ref, &alpha_ref_bits, 4);
+    // The alpha test with half an 8-bit step of tolerance: some passes keep
+    // only fully opaque texels (alpha >= 1.0, >= 254/255), and a texel of 255
+    // filters to exactly 1.0 on AMD (and the Xbox 360) but a hair less on
+    // NVIDIA and WARP, which then dropped random pixels (speckled characters
+    // and floors). Moving the reference half a step the forgiving way makes
+    // alpha compare at the 8 bits it was authored in. Equal / not equal keep it.
+    if (REXCVAR_GET(tenchuz_native_alpha_test_tolerance)) {
+      constexpr float kHalfStep = 0.5f / 255.0f;
+      const uint32_t func = uint32_t(color_control.alpha_func);
+      if (func == 6 || func == 1) alpha_ref -= kHalfStep;  // greater or equal, less
+      if (func == 4 || func == 3) alpha_ref += kHalfStep;  // greater, less or equal
+    }
     sc.alpha_test_reference = alpha_ref;
     // Like the SDK's system constants: alpha to coverage (the shader writes the
     // sample mask) and the host sample count.

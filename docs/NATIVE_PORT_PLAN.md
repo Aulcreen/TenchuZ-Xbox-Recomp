@@ -494,6 +494,19 @@ with a few fixed-step candidates to test at 60 fps.
     the caller and colour source of each logged clear, and the time spent translating shaders and
     creating pipelines in slow frames. Test runs drive the game with `--tenchuz_input_script`
     (`src/input/pc_input.h`) and save their own screenshots, without window focus.
+- **Fixed (2026-10-30): speckled characters and floors on NVIDIA.**
+  - **Symptom:** a player on an NVIDIA card saw black and coloured speckles over the characters'
+    faces, arms, legs and belt ties (character screen and missions), and over tatami floors.
+  - **Reproduced** on WARP (`--d3d12_adapter=-2`, Windows' software D3D12), not on AMD.
+  - **Cause:** the alpha test. Some character passes keep only fully opaque texels: shader
+    `62897F99` with `alpha >= 1.0`, `9B9BFE62` with `alpha >= 254/255`. A texel of 255 filters
+    to exactly 1.0 on AMD (and the Xbox 360's ATI GPU), but to a hair less on NVIDIA and WARP,
+    so pixels failed at random. Switching the alpha test off (debug) removed the speckles.
+    MSAA, early depth and alpha to coverage were ruled out.
+  - **Fix (`--tenchuz_native_alpha_test_tolerance`):** the reference moves half an 8-bit step
+    the forgiving way (`>=`, `<`: down; `>`, `<=`: up; equal and not-equal unchanged), so alpha
+    compares at the 8 bits it was authored in. WARP then matches AMD, and AMD's own image is
+    unchanged (screenshot differences at run-to-run noise).
 
 ### Track A: native audio (low priority: audio already works)
 - **A1** Map XACT/XAudio usage: which voices take XMA from the `.xwb` banks.
