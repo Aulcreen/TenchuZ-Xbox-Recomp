@@ -295,7 +295,7 @@ class GameMenu final : public rex::ui::ImGuiDialog {
     Check("Lasting blood", "tenchuz_lasting_blood");
     if (!kWindows) return;
     Choice("Resolution", "tenchuz_native_resolution_scale",
-           {{"1", "720p (original)"}, {"2", "1440p (2x)"}, {"3", "2160p (3x)"}, {"4", "2880p (4x)"}});
+           {{"0", "Auto"}, {"1", "720p (original)"}, {"2", "1440p (2x)"}, {"3", "2160p (3x)"}, {"4", "2880p (4x)"}});
     Choice("Anti-aliasing", "tenchuz_native_post_effect",
            {{"none", "Off"}, {"fxaa", "FXAA"}, {"fxaa_extreme", "FXAA (strong)"}});
     Choice("MSAA", "tenchuz_native_msaa_samples", {{"0", "2x (original)"}, {"4", "4x"}});

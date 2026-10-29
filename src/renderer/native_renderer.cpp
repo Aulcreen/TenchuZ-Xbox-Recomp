@@ -41,6 +41,7 @@
 
 #include <psapi.h>  // after windows.h (d3d12_api.h)
 
+#include "auto_resolution.h"
 #include "draw_path.h"
 #include "hook_common.h"
 #include "native_gpu.h"
@@ -66,8 +67,11 @@ REXCVAR_DEFINE_INT32(tenchuz_native_log_every, 0, "tenchuz",
                      "Log one native frame every N frames (0 = off)");
 REXCVAR_DEFINE_BOOL(tenchuz_native_msaa, true, "tenchuz",
                     "Native render targets use the guest's MSAA sample count (RB_SURFACE_INFO)");
-REXCVAR_DEFINE_INT32(tenchuz_native_resolution_scale, 1, "tenchuz",
-                     "Internal resolution of native rendering, in multiples of the game's (1-4)");
+REXCVAR_DEFINE_INT32(tenchuz_native_resolution_scale, 0, "tenchuz",
+                     "Internal resolution of native rendering, in multiples of the game's 720p (1-4); 0: "
+                     "automatic, the highest the GPU keeps up with, up to the display's");
+REXCVAR_DEFINE_BOOL(tenchuz_native_single_sample_shadows, true, "tenchuz",
+                    "Draw depth-only tiled passes (the shadow map) without MSAA: the game reads one sample of them");
 REXCVAR_DEFINE_BOOL(tenchuz_native_log_presents, false, "tenchuz",
                     "Log every native frame end: the front buffer, when it was last resolved, and the frame's "
                     "draws, resolves and clears");
@@ -155,6 +159,8 @@ struct FrameSlot {
   ComPtr<ID3D12CommandAllocator> allocator;
   ComPtr<ID3D12CommandAllocator> present_allocator;
   uint64_t fence_value = 0;
+  bool timed = false;     // its frame list has GPU timestamps to read (auto resolution)
+  bool gameplay = false;  // and was a 3D scene
   // Resources replaced during this slot's frame, released once its fence passes
   // (earlier commands in that frame and the previous one may still use them).
   std::vector<ComPtr<ID3D12Resource>> retired;
@@ -373,8 +379,13 @@ uint32_t GuestSampleCount(uint8_t* base) {
 // Host MSAA sample count of the bound targets: the guest's, or 4 for the
 // guest's multisampled targets with --tenchuz_native_msaa_samples=4. Lower
 // when the host can't multisample every target format at that count.
+// A tiled pass that clears only depth (the shadow map): the game resolves
+// one sample of it, so it's drawn without MSAA (tenchuz_native_single_sample_
+// shadows). Set at that clear, until the pass ends.
+bool g_single_sample_pass = false;
+
 uint32_t SampleCount(uint8_t* base) {
-  if (!REXCVAR_GET(tenchuz_native_msaa)) {
+  if (!REXCVAR_GET(tenchuz_native_msaa) || g_single_sample_pass) {
     return 1;
   }
   const uint32_t guest = GuestSampleCount(base);
@@ -472,12 +483,79 @@ FrameSlot& WaitForSlot() {
 
 uint64_t g_previous_frame_fence = 0;  // the last fence signalled before this frame's recording
 
+// Automatic resolution (--tenchuz_native_resolution_scale=0): the GPU time of
+// each frame list, from timestamps at its start and end (two per frame slot),
+// read once the slot's fence has passed.
+ComPtr<ID3D12QueryHeap> g_timestamps;
+ComPtr<ID3D12Resource> g_timestamp_readback;
+uint64_t g_timestamp_frequency = 0;
+AutoResolution g_auto_resolution;
+uint32_t g_display_scale = 2;  // the scale matching the display's height
+std::chrono::steady_clock::time_point g_display_checked;
+
+bool AutoScale() { return REXCVAR_GET(tenchuz_native_resolution_scale) <= 0; }
+
+// The scale whose height is closest to the display's (1080p and 1440p: 2x,
+// 2160p: 3x), from the monitor the game window is on.
+uint32_t DisplayScale() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - g_display_checked < std::chrono::seconds(5)) return g_display_scale;
+  g_display_checked = now;
+  HWND window = nullptr;
+  EnumWindows(
+      [](HWND hwnd, LPARAM param) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId() || !IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER)) return TRUE;
+        *reinterpret_cast<HWND*>(param) = hwnd;
+        return FALSE;
+      },
+      LPARAM(&window));
+  MONITORINFO info = {};
+  info.cbSize = sizeof(info);
+  if (window && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &info)) {
+    const double height = double(info.rcMonitor.bottom - info.rcMonitor.top);
+    g_display_scale = uint32_t(std::clamp(height / 720.0 + 0.5, 1.0, 4.0));
+  }
+  return g_display_scale;
+}
+
+// One frame at the frame rate the game runs 3D scenes at.
+double FrameBudgetMs() {
+  return rex::cvar::GetFlagByName("tenchuz_frame_rate") == "30" ? 1000.0 / 30.0 : 1000.0 / 60.0;
+}
+
+// The finished frame of `slot`: its GPU time goes to the automatic resolution.
+void ReadFrameTime(FrameSlot& slot, uint32_t index) {
+  if (!slot.timed) return;
+  slot.timed = false;
+  if (!slot.gameplay || !g_timestamp_frequency) return;
+  uint64_t* ticks = nullptr;
+  const D3D12_RANGE range = {index * 16, index * 16 + 16};
+  if (FAILED(g_timestamp_readback->Map(0, &range, reinterpret_cast<void**>(&ticks)))) return;
+  const uint64_t start = ticks[index * 2], end = ticks[index * 2 + 1];
+  const D3D12_RANGE none = {0, 0};
+  g_timestamp_readback->Unmap(0, &none);
+  if (end <= start) return;
+  const double ms = double(end - start) * 1000.0 / double(g_timestamp_frequency);
+  g_auto_resolution.AddFrame(ms, FrameBudgetMs(), DisplayScale(), std::chrono::steady_clock::now());
+}
+
+// The scale to draw at: the setting's, or the automatic one.
+uint32_t WantedScale() {
+  if (!AutoScale()) return uint32_t(std::clamp(REXCVAR_GET(tenchuz_native_resolution_scale), 1, 4));
+  const uint32_t scale = g_auto_resolution.scale();
+  return scale ? scale : DisplayScale();
+}
+
 void BeginRecording() {
   if (g_recording) {
     return;
   }
   FrameSlot& slot = WaitForSlot();
-  g_resolve_descriptors_used[g_frame % kFramesInFlight] = 0;
+  const uint32_t slot_index = uint32_t(g_frame % kFramesInFlight);
+  ReadFrameTime(slot, slot_index);
+  g_resolve_descriptors_used[slot_index] = 0;
   // The GPU may still be running the previous frame while this one is
   // recorded. Draws read a guest-memory mirror that is updated in place, so
   // the draw path waits for that frame (FrameHost::WaitForPreviousFrame) only
@@ -487,6 +565,10 @@ void BeginRecording() {
   slot.retired.clear();
   slot.allocator->Reset();
   g_list->Reset(slot.allocator.Get(), nullptr);
+  if (g_timestamps && AutoScale()) {
+    g_list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_index * 2);
+    slot.timed = true;
+  }
   if (g_draw_path) {
     g_draw_path->BeginFrame(uint32_t(g_frame % kFramesInFlight));
   }
@@ -1362,6 +1444,7 @@ void OnD3DCall(uint32_t function, uint8_t* base) {
   }
   if (function == kApiEndTiling) {
     g_tiling = false;
+    g_single_sample_pass = false;
   }
   if (g_in_resolve && function != kApiResolve && g_device) {
     if (const uint32_t info = Dev(base, kDevCopyDestInfo)) {
@@ -1659,7 +1742,7 @@ uint32_t g_applied_msaa = 0;
 bool g_applied_stencil = false;
 
 void ApplyRenderSettings() {
-  const uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(tenchuz_native_resolution_scale), 1, 4));
+  const uint32_t scale = WantedScale();
   const uint32_t msaa = REXCVAR_GET(tenchuz_native_msaa_samples) >= 4 ? 4 : 0;
   if (scale == g_scale && msaa == g_applied_msaa && g_depth_stencil == g_applied_stencil) {
     return;
@@ -1717,6 +1800,14 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
     FlushPendingClears();
     if (g_draw_path) {
       g_draw_path->EndFrame(g_list.Get(), g_frame);
+    }
+    FrameSlot& timed = g_slots[g_frame % kFramesInFlight];
+    if (timed.timed) {
+      const uint32_t index = uint32_t(g_frame % kFramesInFlight);
+      g_list->EndQuery(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index * 2 + 1);
+      g_list->ResolveQueryData(g_timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index * 2, 2,
+                               g_timestamp_readback.Get(), index * 16);
+      timed.gameplay = g_last_depth_draws.load(std::memory_order_relaxed) > 0;  // (the previous frame's)
     }
     g_list->Close();
     ID3D12CommandList* lists[] = {g_list.Get()};
@@ -1902,6 +1993,27 @@ bool CreateResources() {
     return false;
   }
   g_fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+  {
+    D3D12_QUERY_HEAP_DESC query = {};
+    query.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query.Count = kFramesInFlight * 2;
+    D3D12_RESOURCE_DESC buffer = {};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = kFramesInFlight * 16;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES readback = {D3D12_HEAP_TYPE_READBACK};
+    if (FAILED(g_provider->GetDirectQueue()->GetTimestampFrequency(&g_timestamp_frequency)) ||
+        FAILED(g_d3d->CreateQueryHeap(&query, IID_PPV_ARGS(&g_timestamps))) ||
+        FAILED(g_d3d->CreateCommittedResource(&readback, D3D12_HEAP_FLAG_NONE, &buffer,
+                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&g_timestamp_readback)))) {
+      g_timestamps.Reset();  // no automatic resolution: it stays at the display's scale
+    }
+  }
   SetDebugName(g_list.Get(), "tenchuz native frame list");
   SetDebugName(g_present_list.Get(), "tenchuz native present list");
   SetDebugName(g_fence.Get(), "tenchuz native fence");
@@ -2085,9 +2197,9 @@ void Initialize(rex::Runtime* runtime) {
     factory->EnumAdapterByLuid(g_d3d->GetAdapterLuid(), IID_PPV_ARGS(&g_adapter));
   }
   if (g_ready) {
-    g_scale = uint32_t(std::clamp(REXCVAR_GET(tenchuz_native_resolution_scale), 1, 4));
-    if (g_scale > 1) {
-      REXLOG_INFO("tenchuz: native resolution scale {}x", g_scale);
+    g_scale = WantedScale();
+    if (g_scale > 1 || AutoScale()) {
+      REXLOG_INFO("tenchuz: native resolution scale {}x{}", g_scale, AutoScale() ? " (automatic)" : "");
     }
     g_applied_msaa = REXCVAR_GET(tenchuz_native_msaa_samples) >= 4 ? 4 : 0;
     if (g_applied_msaa) {
@@ -2195,6 +2307,9 @@ void OnClear(uint8_t* base, uint32_t flags, uint32_t color_ptr, double z, uint32
   // clear would wipe the parts still to be resolved (the shadow map's right
   // half). Clears there wait for the next draw or clear.
   if (g_tiling) {
+    if (!(flags & 0xF) && (flags & 0x10) && REXCVAR_GET(tenchuz_native_single_sample_shadows)) {
+      g_single_sample_pass = true;
+    }
     if ((flags & 0xF) && Dev(base, kDevRenderTarget0)) {
       if (Surface* s = ColorTarget(base, 0)) {
         g_pending_clear.color = s;
@@ -2306,6 +2421,7 @@ void OnBeginTiling(uint8_t* base, uint32_t count, uint32_t rects) {
     g_bound_height = bottom;
   }
   g_tiling = count > 1;
+  g_single_sample_pass = false;
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE begin tiling {} tiles -> {}x{}", count, right, bottom);
   }

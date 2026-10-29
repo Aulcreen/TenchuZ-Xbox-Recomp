@@ -7,6 +7,7 @@
 
 #include "generated/default/tenchuz_pch.h"
 
+
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
@@ -20,10 +21,13 @@
 #include <chrono>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/string/buffer.h>
 
+REXCVAR_DEFINE_BOOL(tenchuz_native_early_z, true, "tenchuz",
+                    "Let the GPU reject hidden pixels before shading them, where the draw allows it");
 REXCVAR_DEFINE_BOOL(tenchuz_native_dump_shaders, false, "tenchuz",
                     "Write each new shader's microcode disassembly to logs/shaders/");
 
@@ -181,6 +185,15 @@ bool ShaderCache::Prepare(const pm4::DrawInfo& draw, const pm4::Decoder& state, 
                                 regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
                                 regs.Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl,
                                 regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
+    // Every translated pixel shader carries the alpha test as a discard,
+    // which makes the GPU shade a pixel before its depth test. Where the
+    // draw can't change coverage (no alpha test or alpha to coverage) and the
+    // shader neither kills pixels nor writes depth, [earlydepthstencil] tests
+    // depth first (the SDK's D3D12 pipeline cache does the same).
+    if (REXCVAR_GET(tenchuz_native_early_z) && ps->implicit_early_z_write_allowed() &&
+        !gfx::draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>())) {
+      ps_mod.pixel.depth_stencil_mode = gfx::DxbcShaderTranslator::Modification::DepthStencilMode::kEarlyHint;
+    }
     if (ps_param_gen_pos < xenos::kMaxInterpolators) {
       ps_mod.pixel.param_gen_enable = 1;
       ps_mod.pixel.param_gen_interpolator = ps_param_gen_pos;

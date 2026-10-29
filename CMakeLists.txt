@@ -58,6 +58,7 @@ if(WIN32)
         src/sdk_fixes.cpp
         src/ui/audio_volume.cpp
         src/png_writer.cpp
+        src/renderer/auto_resolution.cpp
         src/renderer/draw_path.cpp
         src/renderer/native_gpu.cpp
         src/renderer/native_renderer.cpp
