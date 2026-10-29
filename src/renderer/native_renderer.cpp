@@ -178,6 +178,7 @@ ComPtr<ID3D12PipelineState> g_blit_pso;
 ComPtr<ID3D12PipelineState> g_resolve_pso;  // resolve with format conversion (same root as the blit)
 ComPtr<ID3D12PipelineState> g_resolve_msaa_pso;        // ... from a multisampled colour target
 ComPtr<ID3D12PipelineState> g_resolve_depth_msaa_pso;  // one sample of a multisampled depth buffer
+ComPtr<ID3D12PipelineState> g_blood_dry_pso, g_blood_under_pso;  // blood maps' dried layers
 ComPtr<ID3D12PipelineState> g_resolve_depth_pso;       // a single-sampled depth buffer (or part of one)
 bool g_msaa_2x = false, g_msaa_4x = false;  // host support for every target format
 // FXAA on the presented image (--tenchuz_native_post_effect), like the SDK's
@@ -666,6 +667,33 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// Blood maps' dried layers (SetBloodMapResolve): the map's colours are
+// premultiplied (splats blended over transparent black). Drying keeps the
+// map darkened by `scale`; under puts the layer beneath newer splats.
+constexpr char kBloodDryShader[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Params : register(b0) { uint width; uint height; float scale; uint pad; uint src_at; uint dst_at; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+  if (id.x >= width || id.y >= height) return;
+  float4 c = src.Load(int3(id.xy, 0));
+  dst[id.xy] = float4(c.rgb * scale, c.a);
+}
+)";
+constexpr char kBloodUnderShader[] = R"(
+Texture2D<float4> src : register(t0);
+RWTexture2D<float4> dst : register(u0);
+cbuffer Params : register(b0) { uint width; uint height; float scale; uint pad; uint src_at; uint dst_at; };
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+  if (id.x >= width || id.y >= height) return;
+  float4 top = dst[id.xy];
+  dst[id.xy] = top + src.Load(int3(id.xy, 0)) * (1.0 - top.a);
+}
+)";
+constexpr float kBloodDrying = 0.7f;  // a dried layer's colour, of what it was
+
 // Contrast adaptive sharpening, after AMD FidelityFX CAS (its non-scaling
 // path): each pixel is pushed away from its 4 neighbours by an amount that
 // shrinks where the 3x3 neighbourhood already has strong contrast, so edges
@@ -807,6 +835,15 @@ bool CreateBlit() {
     pso.CS = {msaa_code->GetBufferPointer(), msaa_code->GetBufferSize()};
     if (FAILED(g_d3d->CreateComputePipelineState(&pso, IID_PPV_ARGS(out)))) {
       return false;
+    }
+  }
+  for (auto [source, out] :
+       {std::pair{kBloodDryShader, &g_blood_dry_pso}, std::pair{kBloodUnderShader, &g_blood_under_pso}}) {
+    ComPtr<ID3DBlob> blood_code;
+    if (SUCCEEDED(compile(source, std::strlen(source), "blood", nullptr, nullptr, "main", "cs_5_0", 0, 0,
+                          &blood_code, &errors))) {
+      pso.CS = {blood_code->GetBufferPointer(), blood_code->GetBufferSize()};
+      g_d3d->CreateComputePipelineState(&pso, IID_PPV_ARGS(out));
     }
   }
   // 2x / 4x MSAA for every format a target can have (and the depth format).
@@ -2423,6 +2460,71 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
 // 0x100 / 0x200 clear the render target / depth-stencil afterwards. The source
 // comes from the flags because in tiled passes the device's RB_COPY_CONTROL
 // shadow is not updated per call (a depth resolve showed render target 0).
+// --- Blood maps' dried layers (native_renderer.h) ----------------------------
+
+struct BloodLayer {
+  Surface dried;
+  bool dry_next = false;
+};
+constexpr int kBloodMaps = 4;
+BloodLayer g_blood_layers[kBloodMaps];
+int g_blood_map = -1;            // the map the coming resolve is
+bool g_blood_layers_ok = false;  // a map resolved in a format compute can load and store
+
+// Whether compute passes can read and write `format` through a UAV.
+bool LoadStoreUav(DXGI_FORMAT format) {
+  static std::unordered_map<uint32_t, bool> known;
+  auto [it, added] = known.try_emplace(uint32_t(format), false);
+  if (added) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {format};
+    it->second = SUCCEEDED(g_d3d->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) &&
+                 (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD) &&
+                 (support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
+  }
+  return it->second;
+}
+
+// Before a blood map's resolve overwrites `map`: keeps what it holds as the
+// dried layer, when asked.
+void DryBloodLayer(BloodLayer& layer, Surface& map) {
+  if (!layer.dry_next || !map.resolved_frame) {
+    return;
+  }
+  layer.dry_next = false;
+  if (!layer.dried.resource || layer.dried.format != map.format || layer.dried.host_width() != map.host_width() ||
+      layer.dried.host_height() != map.host_height()) {
+    if (layer.dried.resource) {
+      g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(layer.dried.resource));
+    }
+    layer.dried = Surface();
+    if (!CreateTexture(layer.dried, map.format, map.width, map.height, false, false, true, 1, map.scale)) {
+      layer.dried = Surface();
+      return;
+    }
+    SetDebugName(layer.dried.resource.Get(), "tenchuz dried blood");
+  }
+  ResolveCompute(map, map.format, layer.dried, map.format, g_blood_dry_pso.Get(), map.host_width(),
+                 map.host_height(), kBloodDrying, 0);
+}
+
+void SetBloodMapResolve(int player) { g_blood_map = player >= 0 && player < kBloodMaps ? player : -1; }
+
+void DryBloodMap(int player) {
+  if (player >= 0 && player < kBloodMaps) g_blood_layers[player].dry_next = true;
+}
+
+void ClearBloodMap(int player) {
+  if (player < 0 || player >= kBloodMaps) return;
+  BloodLayer& layer = g_blood_layers[player];
+  layer.dry_next = false;
+  if (layer.dried.resource) {
+    g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(layer.dried.resource));
+  }
+  layer.dried = Surface();
+}
+
+bool BloodMapLayers() { return Active() && g_blood_layers_ok; }
+
 void OnResolveStart(uint8_t* base, uint32_t source_rect, uint32_t dest_point) {
   g_resolve_area.clear();
   g_rect_left = source_rect ? REX_LOAD_U32(source_rect) : 0;
@@ -2505,7 +2607,10 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
                                dest_format == src->format && exp_bias == 0 && HardwareResolvable(src->format);
   const uint64_t key = TextureKey(dest, copy_width, copy_height);
   Surface& dst = g_textures[key];
-  if (!dst.resource || dst.format != dest_format || (convert && !dst.unordered_access)) {
+  // A blood map with a dried layer is written by compute too.
+  const bool blood = g_blood_map >= 0 && g_blood_dry_pso && g_blood_under_pso && LoadStoreUav(dest_format);
+  if (g_blood_map >= 0) g_blood_layers_ok = blood;
+  if (!dst.resource || dst.format != dest_format || ((convert || blood) && !dst.unordered_access)) {
     if (dst.resource) {
       if (Logging()) {
         REXLOG_INFO("tenchuz: NATIVE resolve destination {:08X} {}x{} recreated for format {}", dest,
@@ -2514,7 +2619,7 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
       g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(dst.resource));
     }
     dst = Surface();
-    if (!CreateTexture(dst, dest_format, copy_width, copy_height, false, false, convert, 1, src->scale)) {
+    if (!CreateTexture(dst, dest_format, copy_width, copy_height, false, false, convert || blood, 1, src->scale)) {
       if (g_latest_texture[dest] == &dst) {
         g_latest_texture.erase(dest);
       }
@@ -2539,6 +2644,8 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
   dst.guest_bytes = ((dest_width + 31) & ~31u) * ((dest_height + 31) & ~31u) * BytesPerPixel(dest_format);
   ++g_frame_resolves;
   dst.red_blue_swapped = (dest_info >> 24) & 1;
+  BloodLayer* layer = blood ? &g_blood_layers[g_blood_map] : nullptr;
+  if (layer) DryBloodLayer(*layer, dst);
   const uint32_t op = BeginOp("resolve copy", dest, (dest_width << 16) | dest_height);
   bool done = true;
   if (hardware_resolve && (samples >> 2) == src->samples && (samples & 3) == 0 && area.whole &&
@@ -2558,6 +2665,10 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
     D3D12_TEXTURE_COPY_LOCATION from = {src->resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
     D3D12_BOX box = {area.src_x, area.src_y, 0, area.src_x + area.width, area.src_y + area.height, 1};
     g_list->CopyTextureRegion(&to, area.dst_x, area.dst_y, 0, &from, &box);
+  }
+  if (layer && layer->dried.resource) {
+    ResolveCompute(layer->dried, dst.format, dst, dst.format, g_blood_under_pso.Get(), dst.host_width(),
+                   dst.host_height(), 1.0f, 0);
   }
   EndOp(op);
   if (Logging()) {

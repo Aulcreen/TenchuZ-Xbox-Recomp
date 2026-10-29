@@ -292,6 +292,7 @@ class GameMenu final : public rex::ui::ImGuiDialog {
     Choice("Aspect ratio", "tenchuz_aspect_ratio",
            {{"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}, {"32:9", "32:9"}});
     Check("HUD at 16:9", "tenchuz_widescreen_hud");
+    Check("Lasting blood", "tenchuz_lasting_blood");
     if (!kWindows) return;
     Choice("Resolution", "tenchuz_native_resolution_scale",
            {{"1", "720p (original)"}, {"2", "1440p (2x)"}, {"3", "2160p (3x)"}, {"4", "2880p (4x)"}});

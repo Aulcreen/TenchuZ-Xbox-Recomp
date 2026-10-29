@@ -48,4 +48,18 @@ void OnSwap(uint8_t* base, uint32_t device);
 // -1 when the native renderer isn't drawing.
 int LastFrameDepthDraws();
 
+// Blood maps (blood.cpp). A map holds 64 splats; to keep blood stacking past
+// that, the renderer keeps a dried layer under each map: what the map held,
+// darkened, which the game's later splats are drawn over.
+// The resolve made while `player`'s map is drawn (-1: none).
+void SetBloodMapResolve(int player);
+// The next resolve of `player`'s map first keeps all the map holds as its
+// dried layer (call before the game's splats are dropped).
+void DryBloodMap(int player);
+// Drops `player`'s dried layer (washed off, or a new level).
+void ClearBloodMap(int player);
+// Whether dried layers work: the native renderer draws, and has resolved a map
+// in a format it can blend.
+bool BloodMapLayers();
+
 }  // namespace tenchuz::native

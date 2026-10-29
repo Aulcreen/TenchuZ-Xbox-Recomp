@@ -35,6 +35,7 @@ endif()
 # Sources
 set(TENCHUZ_SOURCES
     src/main.cpp
+    src/blood.cpp
     src/crash_report.cpp
     src/frame_rate.cpp
     src/frame_stats.cpp

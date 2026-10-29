@@ -37,6 +37,10 @@ void SetCacheDir(const std::filesystem::path&) {}
 void RequestScreenshot(const std::filesystem::path&) {}
 void OnSwap(uint8_t*, uint32_t) {}
 int LastFrameDepthDraws() { return -1; }
+void SetBloodMapResolve(int) {}
+void DryBloodMap(int) {}
+void ClearBloodMap(int) {}
+bool BloodMapLayers() { return false; }
 
 }  // namespace tenchuz::native
 
