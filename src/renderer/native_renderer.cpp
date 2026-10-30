@@ -70,6 +70,8 @@ REXCVAR_DEFINE_BOOL(tenchuz_native_msaa, true, "tenchuz",
 REXCVAR_DEFINE_INT32(tenchuz_native_resolution_scale, 0, "tenchuz",
                      "Internal resolution of native rendering, in multiples of the game's 720p (1-4); 0: "
                      "automatic, the highest the GPU keeps up with, up to the display's");
+REXCVAR_DEFINE_BOOL(tenchuz_native_depth_read_resolve, true, "tenchuz",
+                    "Read multisampled depth for its resolves in the depth-read state (lets drivers skip decompressing it)");
 REXCVAR_DEFINE_BOOL(tenchuz_native_single_sample_shadows, true, "tenchuz",
                     "Draw depth-only tiled passes (the shadow map) without MSAA: the game reads one sample of them");
 REXCVAR_DEFINE_BOOL(tenchuz_native_log_presents, false, "tenchuz",
@@ -90,6 +92,9 @@ REXCVAR_DEFINE_STRING(tenchuz_native_post_effect, "none", "tenchuz",
 REXCVAR_DEFINE_DOUBLE(tenchuz_native_sharpening, 0.0, "tenchuz",
                       "Contrast adaptive sharpening (AMD FidelityFX CAS) of the presented image: 0 = off, up to 1")
     .range(0.0, 1.0);
+REXCVAR_DEFINE_BOOL(tenchuz_native_lend_resolves, true, "tenchuz",
+                    "A whole single-sampled render target resolved to a texture lends it its memory instead of "
+                    "copying; the target gets it back only if drawn on before a clear");
 REXCVAR_DEFINE_BOOL(tenchuz_native_hardware_resolve, true, "tenchuz",
                     "MSAA colour resolves that average every sample use the GPU's own resolve");
 REXCVAR_DEFINE_BOOL(tenchuz_native_depth32, true, "tenchuz",
@@ -151,6 +156,7 @@ std::unique_ptr<DrawPath> g_draw_path;
 uint32_t g_frame_draws = 0, g_frame_draws_ready = 0;
 uint32_t g_frame_resolves = 0, g_frame_clears = 0;  // --tenchuz_native_log_presents
 uint32_t g_frame_resolves_skipped = 0;  // per-tile repeats (AlreadyResolved)
+uint32_t g_frame_lent = 0, g_frame_returned = 0;  // LendResolve, ReturnLent
 std::map<uint64_t, uint32_t> g_draw_kinds;  // (API function, opcode, predicated) -> draws, logged frames
 
 // --- D3D12 plumbing ---------------------------------------------------------
@@ -228,6 +234,12 @@ struct Surface {
   uint64_t resolved_writes = 0, resolved_settings = 0;
   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
   D3D12_CPU_DESCRIPTOR_HANDLE view = {};  // RTV or DSV (render targets only)
+  // Lent resolves (LendResolve): a render target whose content a texture
+  // holds, and that texture. The target's own resource holds nothing until
+  // ReturnLent copies the content back.
+  Surface* lent_to = nullptr;
+  Surface* lent_from = nullptr;
+  bool lend_returned = false;  // a loan to this texture had to be copied back: copy instead
 
   uint32_t host_width() const { return width * scale; }
   uint32_t host_height() const { return height * scale; }
@@ -593,7 +605,91 @@ void EndOp(uint32_t op) {
   }
 }
 
+// --- Lent resolves -----------------------------------------------------------
+//
+// The game resolves whole render targets to textures and then mostly clears
+// them (the scene before post-processing, the front buffer). Instead of a
+// copy, the texture takes the target's resource and the target another one
+// (LendResolve). The target's content is copied back only if it's drawn on,
+// resolved or partly overwritten first, or the texture is about to change
+// (ReturnLent); a clear just ends the loan (EndLoanForClear). 0.3 ms per
+// full-screen copy at 4x. A texture whose loan was copied back gets copies
+// from then on: the game's blur passes draw on again right after resolving.
+
+// Copies a lent target's content back from the texture holding it.
+void ReturnLent(Surface& target) {
+  Surface* texture = target.lent_to;
+  if (!texture) {
+    return;
+  }
+  target.lent_to = nullptr;
+  texture->lent_from = nullptr;
+  texture->lend_returned = true;
+  ++g_frame_returned;
+  const uint32_t op = BeginOp("return lent", target.width, target.height);
+  Transition(*texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  Transition(target, D3D12_RESOURCE_STATE_COPY_DEST);
+  g_list->CopyResource(target.resource.Get(), texture->resource.Get());
+  EndOp(op);
+}
+
+// Before `texture` is written or replaced: its lender gets its content back.
+void ReturnLentFrom(Surface& texture) {
+  if (texture.lent_from) {
+    ReturnLent(*texture.lent_from);
+  }
+}
+
+// A whole-target clear: what the target lent no longer matters to it.
+void EndLoanForClear(Surface& target) {
+  if (target.lent_to) {
+    target.lent_to->lent_from = nullptr;
+    target.lent_to = nullptr;
+  }
+}
+
+// Resolves `target` (single-sampled, whole) into `texture` (same size and
+// format) by giving the texture the target's resource. The target takes the
+// texture's previous resource if it's a render target like its own, else a
+// new one (once per texture).
+bool LendResolve(Surface& target, Surface& texture) {
+  if (!REXCVAR_GET(tenchuz_native_lend_resolves) || target.depth || !target.view.ptr || target.lent_to ||
+      texture.lend_returned) {
+    return false;
+  }
+  const D3D12_RESOURCE_DESC desc = target.resource->GetDesc();
+  ComPtr<ID3D12Resource> spare;
+  D3D12_RESOURCE_STATES spare_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  const D3D12_RESOURCE_DESC have = texture.resource->GetDesc();
+  if (have.Width == desc.Width && have.Height == desc.Height && have.Format == desc.Format &&
+      have.SampleDesc.Count == 1 && (have.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+    spare = std::move(texture.resource);
+    spare_state = texture.state;
+  } else {
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = desc.Format;
+    if (FAILED(g_d3d->CreateCommittedResource(&rex::ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+                                              &desc, spare_state, &clear, IID_PPV_ARGS(&spare)))) {
+      return false;
+    }
+    SetDebugName(spare.Get(), fmt::format("tenchuz lent RT format {} {}x{}", int(desc.Format), desc.Width,
+                                          desc.Height));
+    g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(texture.resource));
+  }
+  texture.resource = std::move(target.resource);
+  texture.state = target.state;
+  texture.unordered_access = false;
+  target.resource = std::move(spare);
+  target.state = spare_state;
+  g_d3d->CreateRenderTargetView(target.resource.Get(), nullptr, target.view);
+  target.lent_to = &texture;
+  texture.lent_from = &target;
+  ++g_frame_lent;
+  return true;
+}
+
 void ClearColor(Surface& s, const float color[4]) {
+  EndLoanForClear(s);
   ++g_frame_clears;
   ++s.writes;
   const uint32_t op = BeginOp("clear colour", s.width, s.height);
@@ -1385,7 +1481,8 @@ bool IsInternalDraw(uint32_t api_function) {
 // and in tiled passes its packets go to per-tile blocks the observer can't
 // decode yet, so it's read from the device at the D3D calls Resolve makes.
 bool g_in_resolve = false;
-bool g_tiling = false;  // between BeginTiling and EndTiling
+bool g_tiling = false;         // between BeginTiling and the end of EndTiling
+bool g_tiling_ending = false;  // EndTiling has started
 std::string g_resolve_area;  // the Resolve call's source rectangle and destination point, for the log
 // The Resolve call's source rectangle (guest pixels; right/bottom 0 = the whole
 // target) and destination point.
@@ -1442,7 +1539,14 @@ void OnD3DCall(uint32_t function, uint8_t* base) {
   if (function == 0x8241BDE0) {  // SynchronizeToPresentationInterval: the frame's work is done
     tenchuz::OnPresentWait();
   }
+  // EndTiling resolves (and clears) the tiles itself, inside the call: the
+  // pass ends at the next call made outside it, so those resolves still see
+  // the tiled pass (one hardware resolve of the whole target, not one compute
+  // copy per tile).
   if (function == kApiEndTiling) {
+    g_tiling_ending = true;
+  } else if (g_tiling_ending && gpu_observer::TopFunction() == 0) {
+    g_tiling_ending = false;
     g_tiling = false;
     g_single_sample_pass = false;
   }
@@ -1506,6 +1610,7 @@ void OnLiveDraw(const pm4::DrawInfo& draw, const pm4::Decoder& state, uint8_t* b
   for (uint32_t i = 0; i < 4; ++i) {
     target.rtvs[i] = g_null_rtv;
     if (colors[i]) {
+      ReturnLent(*colors[i]);
       ++colors[i]->writes;
       Transition(*colors[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
       target.color_formats[i] = colors[i]->format;
@@ -1750,6 +1855,7 @@ void ApplyRenderSettings() {
   WaitForFence(g_fence_counter, "render settings change");
   if (g_present_source) {
     g_kept_present = std::move(*g_present_source);
+    g_kept_present.lent_from = nullptr;  // its lender goes with the targets below
     g_present_source = &g_kept_present;
   }
   g_pending_clear = {};
@@ -1925,15 +2031,17 @@ void EndFrameAndPresent(uint32_t front_buffer, uint32_t width, uint32_t height, 
   g_draw_kinds.clear();
   if (REXCVAR_GET(tenchuz_native_log_presents)) {
     const Surface* shown = it != g_latest_texture.end() ? it->second : nullptr;
-    REXLOG_INFO("tenchuz: NATIVE frame {} {} {:08X}: {}; {} draws ({} issued), {} resolves ({} repeats skipped), "
-                "{} clears",
+    REXLOG_INFO("tenchuz: NATIVE frame {} {} {:08X}: {}; {} draws ({} issued), {} resolves ({} repeats skipped, "
+                "{} lent, {} returned), {} clears",
                 g_frame, present ? "present" : "end", front_buffer,
                 shown ? fmt::format("resolved {} frames ago", g_frame - shown->resolved_frame)
                       : std::string("not resolved natively"),
-                g_frame_draws, draw_stats.issued, g_frame_resolves, g_frame_resolves_skipped, g_frame_clears);
+                g_frame_draws, draw_stats.issued, g_frame_resolves, g_frame_resolves_skipped, g_frame_lent,
+                g_frame_returned, g_frame_clears);
   }
   g_frame_draws = g_frame_draws_ready = 0;
   g_frame_resolves = g_frame_clears = g_frame_resolves_skipped = 0;
+  g_frame_lent = g_frame_returned = 0;
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE {} front buffer {:08X} {}x{}: {}", present ? "present" : "frame end",
                 front_buffer, width, height,
@@ -2421,6 +2529,7 @@ void OnBeginTiling(uint8_t* base, uint32_t count, uint32_t rects) {
     g_bound_height = bottom;
   }
   g_tiling = count > 1;
+  g_tiling_ending = false;
   g_single_sample_pass = false;
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE begin tiling {} tiles -> {}x{}", count, right, bottom);
@@ -2478,12 +2587,13 @@ uint32_t ResolveSamples(const Surface& src, uint32_t guest_samples) {
 // multisampled source): `src` read through an SRV, `dst` written through a UAV.
 bool ResolveCompute(Surface& src, DXGI_FORMAT srv_format, Surface& dst, DXGI_FORMAT uav_format,
                     ID3D12PipelineState* pso, uint32_t width, uint32_t height, float scale, uint32_t samples,
-                    uint32_t src_at = 0, uint32_t dst_at = 0) {
+                    uint32_t src_at = 0, uint32_t dst_at = 0,
+                    D3D12_RESOURCE_STATES src_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
   uint32_t& used = g_resolve_descriptors_used[g_frame % kFramesInFlight];
   if (!pso || used + 2 > kResolveDescriptors) {
     return false;
   }
-  Transition(src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  Transition(src, src_state);
   Transition(dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   const uint32_t first =
       kFramesInFlight * kPresentDescriptors + uint32_t(g_frame % kFramesInFlight) * kResolveDescriptors + used;
@@ -2531,6 +2641,7 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
   const bool msaa = src->samples > 1;
   const uint64_t key = TextureKey(dest, src->width, src->height);
   Surface& dst = g_textures[key];
+  ReturnLentFrom(dst);  // a colour resolve to the same address and size lent it
   if (!dst.resource || dst.format != DXGI_FORMAT_R32_TYPELESS || !dst.unordered_access) {
     if (dst.resource) {
       g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(dst.resource));
@@ -2559,12 +2670,20 @@ void ResolveDepth(uint8_t* base, uint32_t flags, uint32_t dest) {
   ++g_frame_resolves;
   const uint32_t op = BeginOp("resolve depth", dest, (src->width << 16) | src->height);
   // A compute pass either way: depth-stencil copies can't take a box.
+  // Multisampled depth is read in the depth-read state, which lets drivers
+  // keep it compressed (2.97 -> 0.67 ms at 4x). Single-sampled depth (the
+  // shadow map) isn't: leaving depth-read made its next clear cost 0.48 ms
+  // at 4x on AMD, against 0.01 ms from the plain shader-resource state.
+  const bool depth_read = msaa && REXCVAR_GET(tenchuz_native_depth_read_resolve);
   const bool done = ResolveCompute(*src,
                                    src->format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_FLOAT
                                                                          : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
                                    dst, DXGI_FORMAT_R32_FLOAT,
                                    msaa ? g_resolve_depth_msaa_pso.Get() : g_resolve_depth_pso.Get(), area.width,
-                                   area.height, 1.0f, samples & 3, area.src_at(), area.dst_at());
+                                   area.height, 1.0f, samples & 3, area.src_at(), area.dst_at(),
+                                   depth_read
+                                       ? D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                       : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   EndOp(op);
   if (Logging()) {
     REXLOG_INFO("tenchuz: NATIVE resolve flags {:X} depth {}x{} x{} -> {:08X}{}{} (copy control {:08X})", flags,
@@ -2727,6 +2846,8 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
   const bool blood = g_blood_map >= 0 && g_blood_dry_pso && g_blood_under_pso && LoadStoreUav(dest_format);
   if (g_blood_map >= 0) g_blood_layers_ok = blood;
   if (!dst.resource || dst.format != dest_format || ((convert || blood) && !dst.unordered_access)) {
+    ReturnLentFrom(dst);
+    const bool lend_returned = dst.lend_returned;
     if (dst.resource) {
       if (Logging()) {
         REXLOG_INFO("tenchuz: NATIVE resolve destination {:08X} {}x{} recreated for format {}", dest,
@@ -2735,6 +2856,7 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
       g_slots[g_frame % kFramesInFlight].retired.push_back(std::move(dst.resource));
     }
     dst = Surface();
+    dst.lend_returned = lend_returned;
     if (!CreateTexture(dst, dest_format, copy_width, copy_height, false, false, convert || blood, 1, src->scale)) {
       if (g_latest_texture[dest] == &dst) {
         g_latest_texture.erase(dest);
@@ -2756,6 +2878,8 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
     ++g_frame_resolves_skipped;
     return;
   }
+  ReturnLent(*src);
+  ReturnLentFrom(dst);
   dst.resolved_frame = g_frame;
   dst.guest_bytes = ((dest_width + 31) & ~31u) * ((dest_height + 31) & ~31u) * BytesPerPixel(dest_format);
   ++g_frame_resolves;
@@ -2774,7 +2898,8 @@ void OnResolve(uint8_t* base, uint32_t flags, uint32_t clear_color_ptr, double c
     done = ResolveCompute(*src, src->format, dst, dest_format,
                           src->samples > 1 ? g_resolve_msaa_pso.Get() : g_resolve_pso.Get(), area.width,
                           area.height, std::ldexp(1.0f, exp_bias), samples, area.src_at(), area.dst_at());
-  } else {
+  } else if (!(!blood && src->samples == 1 && area.whole && dst.host_width() == src->host_width() &&
+                 dst.host_height() == src->host_height() && LendResolve(*src, dst))) {
     Transition(*src, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(dst, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION to = {dst.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};

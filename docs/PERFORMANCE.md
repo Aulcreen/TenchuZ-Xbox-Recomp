@@ -36,6 +36,58 @@ CPU per thread from Windows' process counters; GPU from the "GPU Engine 3D" util
     0.77 ms (no decompression of a multisampled shadow map). About 0.7 ms a frame at 1440p.
   - Screenshots match within run-to-run noise.
 
+- **Measuring GPU work (2026-10-30):** at 60 fps the RX 6600 lowers its clocks, so its
+  utilisation and per-draw times say little; 720p and 1440p frames took the same GPU time. A
+  GPU-bound benchmark does: the bridge at 4x (5120x2880, 4x MSAA, FXAA) with the camera turning
+  holds 34-35 fps within about 0.5. Against it:
+  - texture filtering is free;
+  - 4x MSAA costs 11% against the game's 2x;
+  - early depth is worth 2%.
+  - A hand-written world shader (about 90% fewer instructions than its translation, same image)
+    gained nothing: the GPU waits on memory, not on shader arithmetic. Not kept.
+  - At 4x a frame is 27 ms: the 3D scene 44%, the post passes 21%, resolves 23%, present 8%.
+- **Resolves (2026-10-30), 34.3 -> 38.3 fps at 4x (+12%):**
+  - **Tiled resolves in EndTiling:** EndTiling resolves (and clears) the tiles itself, but the
+    renderer ended the tiled pass when EndTiling began. The main scene's resolve
+    (`1F160000`, copy control `0x340`) and a 1024x1024 one were then done as compute copies per
+    tile instead of one hardware resolve. The pass now ends at the next call outside EndTiling:
+    +5.5%.
+  - **Depth read without decompressing (`--tenchuz_native_depth_read_resolve`):** the
+    multisampled depth was moved to the shader-resource state for its resolve, which
+    decompresses it (about 1.6 ms of the 2.6 the resolve cost at 4x). It now moves to
+    depth-read plus shader-resource, which lets the driver read it compressed: +9%. Valid D3D12
+    on every vendor; a driver that can't keep it compressed decompresses as before.
+  - Screenshots match within run-to-run noise (HUD state, animated water and trees).
+- **Where a 4x frame goes (2026-10-31, `--tenchuz_native_profile_timeline` with `gpuprofile`):**
+  every draw and operation's GPU time in order. About 24 ms:
+  - The main scene is 10-12 ms, most of it the world shader (`BDD29634`: 3 material textures and
+    13 point-sampled shadow-map taps).
+  - The final composite (`DB1B0ACD`, depth of field over 6 textures) takes 2 ms.
+  - A quarter-resolution blur chain takes 2 ms: 12 passes of `27A33888` (8 taps each), each pass
+    resolved.
+  - The rest is present (blit 0.8-1.0 ms, FXAA 1 ms), the depth resolve for the composite
+    (0.7 ms), the MSAA resolves (1 ms) and a full-screen copy of the scene (0.65 ms).
+  - Every render target is RGBA8; nothing is wider than it needs to be.
+- **Shadow-map clear (2026-10-31):** reading the single-sampled shadow depth in the depth-read
+  state (as the multisampled depth is) made the clear right after its resolve cost 0.48 ms at 4x,
+  against 0.01 ms from the plain shader-resource state. Depth-read is now for multisampled depth
+  only. The resolve costs the same either way.
+- **Lent resolves (`--tenchuz_native_lend_resolves`, 2026-10-31), +2.3% at 4x:**
+  - A whole single-sampled target resolved to a texture now hands the texture its resource and
+    takes another one, instead of copying. The target only gets its content back if it's drawn on
+    before a clear. A texture whose loan had to be returned gets copies from then on: the blur
+    chain draws on again right after each resolve.
+  - This removes the scene copy before post-processing (`1C3E9000`) and the front buffer's copy
+    (`1F4F8000`), 0.3 ms each at 4x. Blood maps aren't lent: their dried layer is written by
+    compute.
+  - The bridge benchmark: 39.8 / 39.4 fps without, 40.3 / 40.8 with (runs alternated). Screenshots
+    match within run-to-run noise, at 2x through the menus, loading, a fight with blood and the
+    pause menu, and at 1x across live 1x/2x switches.
+- **Tried and dropped (2026-10-31):**
+  - Resolve destinations flagged as render targets, so drivers might keep them compressed: no
+    change (40.4 against 40.6 fps).
+  - Lending the shadow map's depth too: its texture's loan gets returned, so it never paid off.
+
 ## Automatic resolution
 
 `--tenchuz_native_resolution_scale=0` (the default; Esc menu > Display > Resolution > Auto),

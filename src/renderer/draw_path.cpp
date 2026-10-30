@@ -42,6 +42,8 @@
 
 REXCVAR_DEFINE_INT32(tenchuz_native_anisotropy, 16, "tenchuz",
                      "Anisotropic filtering for the game's mipmapped textures: 0 = the game's own, 2, 4, 8 or 16");
+REXCVAR_DEFINE_BOOL(tenchuz_native_profile_timeline, false, "tenchuz",
+                    "GPU profiles (gpuprofile) also list every draw and operation's time in order");
 REXCVAR_DEFINE_BOOL(tenchuz_native_ring_flush, false, "tenchuz",
                     "Native draws: flush mid-frame when command-ring vertex pages are rewritten");
 REXCVAR_DEFINE_BOOL(tenchuz_native_geometry_watch, true, "tenchuz",
@@ -573,6 +575,7 @@ struct DrawPath::Impl {
     uint32_t arena;  // 1: vertices copied to the arena, 2: indices
     uint32_t query;  // occlusion query index + 1 (--tenchuz_native_draw_queries), 0 = none
     uint32_t target_width, target_height, samples;  // host pixels
+    uint32_t color_format;  // DXGI format of RT0 (the GPU profile groups by it)
     uint32_t guest_textures, resolved_textures;
     uint32_t textures[6];  // bound texture addresses, bit 0 set for resolved targets (draw list)
     bool depth_test, hud;  // hud: kept at 16:9 (DrawTarget::hud_scale_x)
@@ -669,7 +672,7 @@ struct DrawPath::Impl {
       uint32_t count = 0;
     };
     std::map<std::string, Group> by_target, by_op;
-    std::vector<std::pair<double, uint32_t>> draws;
+    std::vector<std::pair<double, uint32_t>> draws, ops;
     double total = 0;
     for (uint32_t i = 0; i < n; ++i) {
       const double ms = ts[i + 1] >= ts[i] ? double(ts[i + 1] - ts[i]) * to_ms : 0.0;
@@ -679,10 +682,11 @@ struct DrawPath::Impl {
         Group& g = by_op[r.op];
         g.ms += ms;
         ++g.count;
+        ops.emplace_back(ms, i);
         continue;
       }
-      Group& g = by_target[fmt::format("{}x{} x{} {}", r.target_width, r.target_height, r.samples,
-                                       r.depth_test ? "3D" : "2D")];
+      Group& g = by_target[fmt::format("{}x{} x{} {} fmt {}", r.target_width, r.target_height, r.samples,
+                                       r.depth_test ? "3D" : "2D", r.color_format)];
       g.ms += ms;
       ++g.count;
       draws.emplace_back(ms, i);
@@ -699,13 +703,35 @@ struct DrawPath::Impl {
     };
     log_groups("target", by_target);
     log_groups("operation", by_op);
+    if (REXCVAR_GET(tenchuz_native_profile_timeline)) {
+      for (uint32_t i = 0; i < n; ++i) {
+        const DrawRecord& r = list[i];
+        const double ms = ts[i + 1] >= ts[i] ? double(ts[i + 1] - ts[i]) * to_ms : 0.0;
+        if (r.op) {
+          REXLOG_INFO("tenchuz: NATIVE GPU timeline #{} {:.3f} ms {} {:08X} {}x{}", i, ms, r.op, r.prim,
+                      r.count >> 16, r.count & 0xFFFF);
+        } else {
+          REXLOG_INFO("tenchuz: NATIVE GPU timeline #{} {:.3f} ms draw ps {:08X} {}x{} x{}{} count {}", i, ms,
+                      uint32_t(r.ps), r.target_width, r.target_height, r.samples, r.depth_test ? " depth" : "",
+                      r.count);
+        }
+      }
+    }
+    std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t k = 0; k < std::min<size_t>(ops.size(), 12); ++k) {
+      const DrawRecord& r = list[ops[k].second];
+      REXLOG_INFO("tenchuz: NATIVE GPU profile   op #{}: {:.3f} ms, {} {:08X} {}x{}", ops[k].second, ops[k].first,
+                  r.op, r.prim, r.count >> 16, r.count & 0xFFFF);
+    }
     std::sort(draws.begin(), draws.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     for (size_t k = 0; k < std::min<size_t>(draws.size(), 12); ++k) {
       const DrawRecord& r = list[draws[k].second];
-      REXLOG_INFO("tenchuz: NATIVE GPU profile   draw #{}: {:.3f} ms, vs {:08X} ps {:08X}, {} {} on {}x{} x{}{}",
+      REXLOG_INFO("tenchuz: NATIVE GPU profile   draw #{}: {:.3f} ms, vs {:08X} ps {:08X}, {} {} on {}x{} x{} fmt {}{}, "
+                  "textures {:X} {:X} {:X} {:X} {:X} {:X}",
                   draws[k].second, draws[k].first, uint32_t(r.vs), uint32_t(r.ps), r.count,
-                  r.indexed ? "indices" : "vertices", r.target_width, r.target_height, r.samples,
-                  r.depth_test ? " depth" : "");
+                  r.indexed ? "indices" : "vertices", r.target_width, r.target_height, r.samples, r.color_format,
+                  r.depth_test ? " depth" : "", r.textures[0], r.textures[1], r.textures[2], r.textures[3],
+                  r.textures[4], r.textures[5]);
     }
   }
   std::array<uint64_t, kFrames> log_frame{};
@@ -2359,6 +2385,7 @@ bool DrawPath::Draw(ID3D12GraphicsCommandList* list, const pm4::DrawInfo& draw,
   record.target_width = target.width;
   record.target_height = target.height;
   record.samples = target.samples;
+  record.color_format = uint32_t(target.color_formats[0]);
   record.guest_textures = m.stats.textures_guest - guest_textures_before;
   record.resolved_textures = m.stats.textures_resolved - resolved_textures_before;
   for (uint32_t i = 0; i < 6; ++i) {
