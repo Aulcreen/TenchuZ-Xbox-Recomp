@@ -10,8 +10,8 @@
 # (cmake, ninja, the Vulkan loader, MoltenVK) come from Homebrew when it's
 # installed, and from conda-forge into third_party/mac-deps otherwise (with
 # micromamba, downloaded if it's missing; no password needed).
-# The Steamworks files for System Link over Steam are in the repository
-# (third_party/steamworks/sdk); the disc image is the player's own.
+# System Link over Steam needs Valve's Steamworks SDK in
+# third_party/steamworks/sdk; the disc image is the player's own.
 # JOBS=<n> sets the parallel compile jobs (default 4, for 8 GB of memory).
 
 set -euo pipefail
@@ -129,6 +129,7 @@ codesign -d "$macos/tenchuz" >/dev/null 2>&1 || fail "tenchuz has no signature"
 cp "$root/tools/macos/Set Up Game Files.command" "$stage/"
 chmod +x "$stage/Set Up Game Files.command"
 cp "$root/tools/xiso.py" "$stage/.setup/"
+cp "$root/LICENSE" "$root/NOTICE.txt" "$stage/"
 ln -s /Applications "$stage/Applications"
 dmg="$root/dist/TenchuZ-mac.dmg"
 rm -f "$dmg"

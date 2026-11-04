@@ -6,3 +6,5 @@
 # Shell scripts need LF for bash
 *.sh text eol=lf
 *.command text eol=lf
+# Binary files: never convert line endings
+*.pdf binary

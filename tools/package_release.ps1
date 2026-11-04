@@ -39,6 +39,7 @@ foreach ($dll in @("msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll
 }
 
 Copy-Item (Join-Path $PSScriptRoot "release\README.txt") $stage
+foreach ($f in @("LICENSE", "NOTICE.txt")) { Copy-Item (Join-Path $root $f) $stage }
 # The version Windows' installed apps list shows (Setup registers it).
 Set-Content -Path (Join-Path $stage "version.txt") -Value $version -Encoding ascii -NoNewline
 
@@ -49,4 +50,4 @@ $pack = Start-Process -FilePath (Join-Path $build "Setup.exe") -ArgumentList "--
   -NoNewWindow -Wait -PassThru
 if ($pack.ExitCode -ne 0) { throw "Setup.exe --pack failed ($($pack.ExitCode))" }
 $size = [math]::Round((Get-Item $installer).Length / 1MB, 1)
-"Packaged $name ($($files.Count + 5) files) -> $installer ($size MB)"
+"Packaged $name ($($files.Count + 7) files) -> $installer ($size MB)"

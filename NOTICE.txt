@@ -1,0 +1,42 @@
+Tenchu Z Recompiled
+Copyright (C) 2026 Aulcreen
+
+This project's own code is licensed under the GNU General Public License,
+version 3 (see LICENSE). Forks and copies must stay under the same license and
+keep this notice.
+
+Additional permission (GPLv3 section 7)
+---------------------------------------
+You may link this program with the Steamworks API library (steam_api64.dll,
+libsteam_api.dylib) and distribute it with that library, which stays under
+Valve's terms.
+
+The game
+--------
+- Not affiliated with or endorsed by FromSoftware, K2, Microsoft, Valve or any
+  owner of Tenchu. Tenchu and Tenchu Z are trademarks of their owners.
+- No game data is included or distributed. You need your own, legally owned
+  copy of Tenchu Z (Xbox 360). Don't use this project with pirated copies.
+- The program translates the game's own code to run on PC. That code and all
+  game content belong to their owners and are not covered by this project's
+  license. Builds are provided only for use with your own copy of the game.
+
+Online play
+-----------
+Online play (System Link) goes through Steam using Spacewar (App ID 480),
+Valve's public test app. There is no Tenchu Z server: players connect
+directly to their Steam friends, and Steam shows them as playing "Spacewar".
+It may stop working if Valve changes that app.
+
+Third-party code
+----------------
+- ReXGlue SDK and external/xenos_shader: BSD 3-Clause, Copyright (c) 2026 Tom
+  Clay; portions from the Xenia project, Copyright (c) 2022 Ben Vanik and
+  Xenia contributors.
+- Steamworks API library: Valve Corporation, under the Steamworks SDK terms.
+  The SDK itself isn't in this repository; download it from Valve to build
+  with Steam.
+- SDL3 (zlib license) and the Microsoft Visual C++ runtime (redistributable)
+  ship with the Windows build.
+
+No warranty: see LICENSE, sections 15 and 16.
